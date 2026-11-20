@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ct-core = { path = "../ct-core" }
+ct-llm = { path = "../ct-llm" }
+ct-win = { path = "../ct-win" }
+tracing.workspace = true
 
 [dev-dependencies]
 raw-window-handle = "0.6.2"
