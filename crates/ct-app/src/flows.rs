@@ -9,7 +9,7 @@ use ct_core::{
     DICTIONARY_INTEGRITY_MESSAGE, DictionaryEntry, DisplayMode, ExplanationResult,
     LanguageDetector, LlmProvider, TranslateError, UserSettings, explain_text, translate_text,
 };
-use ct_win::chrome::TextInteraction;
+use ct_win::chrome::{ReplaceError, TextInteraction};
 
 pub const MSG_DIRECTION_UNKNOWN: &str = "번역 방향을 판단할 수 없어 원문을 변경하지 않았습니다.";
 pub const MSG_TRANSLATE_FAILED: &str = "번역에 실패하여 원본을 변경하지 않았습니다.";
@@ -52,6 +52,25 @@ impl Drop for BadgeGuard<'_> {
     }
 }
 
+/// Log-safe variant name (never the inner message, which may echo text).
+fn translate_error_kind(e: &TranslateError) -> &'static str {
+    match e {
+        TranslateError::DirectionUnknown => "direction_unknown",
+        TranslateError::Llm(_) => "llm_failed",
+        TranslateError::Integrity => "integrity",
+    }
+}
+
+/// Log-safe variant name (never the inner message).
+fn replace_error_kind(e: &ReplaceError) -> &'static str {
+    match e {
+        ReplaceError::NothingFocused => "nothing_focused",
+        ReplaceError::Unsupported => "unsupported",
+        ReplaceError::ContextChanged => "context_changed",
+        ReplaceError::Paste(_) => "paste",
+    }
+}
+
 fn translate_error_message(e: &TranslateError) -> &'static str {
     match e {
         TranslateError::DirectionUnknown => MSG_DIRECTION_UNKNOWN,
@@ -82,14 +101,25 @@ fn alt_alt_work(
         s.translation_tone,
     ) {
         Ok(t) => t,
-        Err(e) => return Some(translate_error_message(&e)),
+        Err(e) => {
+            tracing::warn!(
+                operation = "alt_alt",
+                status = "translate_failed",
+                error = translate_error_kind(&e)
+            );
+            return Some(translate_error_message(&e));
+        }
     };
     let replacement =
         translated.replacement_text(&captured.context.text, s.include_original_on_replace);
     match ti.replace(&captured, &replacement) {
         Ok(()) => None,
-        Err(_) => {
-            tracing::warn!(operation = "alt_alt", status = "replace_failed");
+        Err(e) => {
+            tracing::warn!(
+                operation = "alt_alt",
+                status = "replace_failed",
+                error = replace_error_kind(&e)
+            );
             Some(MSG_REPLACE_FAILED)
         }
     }
@@ -142,6 +172,7 @@ pub fn ctrl_ctrl_flow(d: &FlowDeps, ti: &dyn TextInteraction, view: &dyn Explain
         operation = "ctrl_ctrl",
         elapsed_ms = started.elapsed().as_millis() as u64,
         ok = result.is_ok(),
+        error = result.as_ref().err().map(translate_error_kind),
         "done"
     );
     match result {
@@ -159,7 +190,7 @@ mod tests {
         TranslationRequest, TranslationResult,
     };
     use ct_core::{Action, Lang, RuleBasedDetector};
-    use ct_win::chrome::{CapturedText, EditingContext, ReplaceError};
+    use ct_win::chrome::{CapturedText, EditingContext};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -386,6 +417,38 @@ mod tests {
 
     fn no_replace(log: &[String]) -> bool {
         !log.iter().any(|l| l.starts_with("replace"))
+    }
+
+    #[test]
+    fn error_kinds_are_variant_names_without_inner_text() {
+        assert_eq!(
+            translate_error_kind(&TranslateError::DirectionUnknown),
+            "direction_unknown"
+        );
+        assert_eq!(
+            translate_error_kind(&TranslateError::Llm("secret text".into())),
+            "llm_failed"
+        );
+        assert_eq!(
+            translate_error_kind(&TranslateError::Integrity),
+            "integrity"
+        );
+        assert_eq!(
+            replace_error_kind(&ReplaceError::NothingFocused),
+            "nothing_focused"
+        );
+        assert_eq!(
+            replace_error_kind(&ReplaceError::Unsupported),
+            "unsupported"
+        );
+        assert_eq!(
+            replace_error_kind(&ReplaceError::ContextChanged),
+            "context_changed"
+        );
+        assert_eq!(
+            replace_error_kind(&ReplaceError::Paste("secret text".into())),
+            "paste"
+        );
     }
 
     #[test]
