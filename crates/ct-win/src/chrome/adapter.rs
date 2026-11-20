@@ -9,7 +9,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use super::strategy::{EditingContext, FocusedElement, Strategy};
-use crate::clipboard::{Clipboard, run_with_temporary_content};
+use crate::clipboard::{Clipboard, lock_clipboard_section, run_with_temporary_content};
 
 const RETRY_ATTEMPTS: usize = 5;
 const RETRY_DELAY: Duration = Duration::from_millis(80);
@@ -83,12 +83,16 @@ fn context_changed(captured: &EditingContext, now: &EditingContext) -> bool {
 
 impl TextInteraction for ChromeAdapter {
     fn capture(&self) -> Option<CapturedText> {
+        // 조사(Ctrl+C·sentinel·복원) 전체를 다른 계열의 캡처·교체와 겹치지 않게 한다(R8).
+        let _section = lock_clipboard_section();
         let focused = self.backend.focused_element()?;
         let context = self.strategy_for(&focused)?.identify_context(&focused)?;
         Some(CapturedText { context })
     }
 
     fn replace(&self, captured: &CapturedText, new_text: &str) -> Result<(), ReplaceError> {
+        // 재조사·붙여넣기·클립보드 복원까지 한 구간으로 묶는다(R8). LLM 호출 중에는 잡지 않는다.
+        let _section = lock_clipboard_section();
         // 아무것도 건드리기 전에 전체 조사를 다시 하고 검증한다.
         let focused = self
             .backend
@@ -441,6 +445,68 @@ mod tests {
             Err(ReplaceError::Paste("paste failed".into()))
         );
         assert_eq!(cb.get_text().as_deref(), Some("old"));
+    }
+
+    /// 조사·붙여넣기마다 (작업 id, 이벤트)를 공유 로그에 남기고 잠깐 쉰다.
+    struct SlowBackend {
+        id: usize,
+        log: Arc<Mutex<Vec<(usize, &'static str)>>>,
+    }
+
+    impl SlowBackend {
+        fn step(&self, start: &'static str, end: &'static str) {
+            self.log.lock().unwrap().push((self.id, start));
+            std::thread::sleep(Duration::from_millis(30));
+            self.log.lock().unwrap().push((self.id, end));
+        }
+    }
+
+    impl UiaBackend for SlowBackend {
+        fn focused_element(&self) -> Option<FocusedElement> {
+            self.step("probe_start", "probe_end");
+            Some(chat(None))
+        }
+        fn foreground_is_docs_or_slides(&self) -> bool {
+            false
+        }
+        fn paste_over_selection(&self) -> Result<(), String> {
+            self.step("paste_start", "paste_end");
+            Ok(())
+        }
+        fn paste_replacing_full_text(&self) -> Result<(), String> {
+            self.step("paste_start", "paste_end");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn concurrent_adapter_operations_do_not_interleave() {
+        // 서로 다른 어댑터(Alt 계열, Ctrl 계열)라도 클립보드·키 입력 구간은 겹치지 않는다(R8).
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let make = |id| {
+            let cb = MemClipboard::new("old");
+            let backend = Arc::new(SlowBackend {
+                id,
+                log: log.clone(),
+            });
+            ChromeAdapter::new(backend, cb, &REPLACE_STRATEGIES)
+        };
+        let alt = make(1);
+        let ctrl = make(2);
+        let captured = cap("hello world");
+        std::thread::scope(|s| {
+            s.spawn(|| alt.replace(&captured, "new").unwrap());
+            s.spawn(|| {
+                ctrl.capture().unwrap();
+            });
+        });
+        let log = log.lock().unwrap();
+        // replace = probe + paste (4 이벤트), capture = probe (2 이벤트). 각 작업은 한 덩어리여야 한다.
+        assert_eq!(log.len(), 6, "{log:?}");
+        let first = log[0].0;
+        let first_len = if first == 1 { 4 } else { 2 };
+        assert!(log[..first_len].iter().all(|e| e.0 == first), "{log:?}");
+        assert!(log[first_len..].iter().all(|e| e.0 != first), "{log:?}");
     }
 
     struct FakeInteraction {

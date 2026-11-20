@@ -2,8 +2,20 @@
 //!
 //! 클립보드 내용은 절대 로그에 남기지 않는다.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+/// 프로세스 전체의 클립보드·합성 키 구간 (R8). Alt 계열과 Ctrl 계열이 동시에 돌아도
+/// 캡처(Ctrl+C·sentinel)와 교체(재조사·붙여넣기·복원)가 서로 섞이지 않게 한다.
+static CLIPBOARD_SECTION: Mutex<()> = Mutex::new(());
+
+/// 구간 잠금을 얻는다. 이전 보유자가 패닉했어도(poison) 그대로 이어서 쓴다.
+pub(crate) fn lock_clipboard_section() -> MutexGuard<'static, ()> {
+    CLIPBOARD_SECTION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// 선택 영역이 없을 때 복사 결과와 구분하기 위한 탐지용 값.
 pub const SENTINEL: &str = "\u{0}claudetranslator_probe\u{0}";
