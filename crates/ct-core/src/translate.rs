@@ -76,6 +76,15 @@ pub(crate) fn prepare(
     })
 }
 
+/// True when `returned` equals `expected` exactly (same languages, same order, same length).
+pub(crate) fn languages_match(returned: impl Iterator<Item = Lang>, expected: &[Lang]) -> bool {
+    returned.eq(expected.iter().copied())
+}
+
+pub(crate) fn language_mismatch() -> TranslateError {
+    TranslateError::Llm("LLM response languages do not match the requested languages".to_string())
+}
+
 /// Logs operation, char count, duration and error kind only (never text).
 pub(crate) fn log_outcome<T>(
     operation: &str,
@@ -131,6 +140,12 @@ fn run_translate(
     let response = llm
         .translate(&request)
         .map_err(|e| TranslateError::Llm(e.0))?;
+    if !languages_match(
+        response.translations.iter().map(|(l, _)| *l),
+        &request.destinations,
+    ) {
+        return Err(language_mismatch());
+    }
     let mut translations = Vec::with_capacity(response.translations.len());
     for (lang, translated) in response.translations {
         let intact = validate_integrity(&prepared.mapping, &translated)
@@ -267,6 +282,30 @@ mod tests {
         llm.push_translate(Err(LlmError("upstream unavailable".into())));
         let out = run("논리 모델 확인", &llm, &[Lang::En]);
         assert_eq!(out, Err(TranslateError::Llm("upstream unavailable".into())));
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn translate_rejects_language_list_mismatch() {
+        let mismatch = Err(language_mismatch());
+        let cases: Vec<(Vec<(Lang, &str)>, Vec<Lang>)> = vec![
+            (vec![(Lang::En, "a")], vec![Lang::En, Lang::Ja]),
+            (vec![], vec![Lang::En]),
+            (
+                vec![(Lang::Ja, "b"), (Lang::En, "a")],
+                vec![Lang::En, Lang::Ja],
+            ),
+            (
+                vec![(Lang::En, "a"), (Lang::En, "a")],
+                vec![Lang::En, Lang::Ja],
+            ),
+            (vec![(Lang::En, "a"), (Lang::Vi, "c")], vec![Lang::En]),
+        ];
+        for (returned, targets) in cases {
+            let llm = FakeLlm::new();
+            llm.push_translate(ok(&returned));
+            assert_eq!(run("논리 모델 확인", &llm, &targets), mismatch);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::dictionary::{
 use crate::lang::Lang;
 use crate::llm::{ExplanationRequest, ExplanationResult, ExplanationSentence, LlmProvider};
 use crate::settings::Tone;
-use crate::translate::{TranslateError, log_outcome, prepare};
+use crate::translate::{TranslateError, language_mismatch, languages_match, log_outcome, prepare};
 
 pub fn explain_text(
     text: &str,
@@ -44,6 +44,16 @@ fn run_explain(
     let response = llm
         .explain(&request)
         .map_err(|e| TranslateError::Llm(e.0))?;
+    if response.sentences.is_empty()
+        || !response.sentences.iter().all(|sentence| {
+            languages_match(
+                sentence.translations.iter().map(|(l, _)| *l),
+                &request.destinations,
+            )
+        })
+    {
+        return Err(language_mismatch());
+    }
     restore_sentence_columns(response, &prepared.mapping).map_err(|_| TranslateError::Integrity)
 }
 
@@ -232,6 +242,28 @@ mod tests {
             Err(TranslateError::DirectionUnknown)
         );
         assert_eq!(llm.explain_calls(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn explain_rejects_empty_sentences_and_language_mismatch() {
+        let mismatch = Err(language_mismatch());
+        let cases: Vec<(Vec<ExplanationSentence>, Vec<Lang>)> = vec![
+            (vec![], vec![Lang::En]),
+            (
+                vec![sentence("확인", &[(Lang::En, "check")])],
+                vec![Lang::En, Lang::Ja],
+            ),
+            (
+                vec![sentence("확인", &[(Lang::En, "check"), (Lang::Vi, "x")])],
+                vec![Lang::En],
+            ),
+        ];
+        for (sentences, targets) in cases {
+            let llm = FakeLlm::new();
+            llm.push_explain(Ok(ExplanationResult { sentences }));
+            assert_eq!(run("확인", &llm, &targets), mismatch);
+        }
     }
 
     #[test]
