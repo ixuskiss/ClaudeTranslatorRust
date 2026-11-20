@@ -233,8 +233,8 @@ Sheets 배치 응답 형식:
 
 | 크레이트 | 역할 | Windows 의존 |
 |---|---|---|
-| `ct-core` | 설정 모델·저장, 개인 사전 로드·저장·마스킹·복원, 언어 판별, `resolve_plan`, `compose_replacement`, 번역·설명·교정 서비스, 교정 규칙, 파일 문제 수집 | 없음 |
-| `ct-llm` | `LlmProvider` trait, `MockProvider`, `ClaudeCliProvider`(프롬프트, JSON 검증), `ClaudeCliClient`(상주 프로세스, stream-json, 타임아웃, `/clear` 주기, 재시작, `initialize` 모델 조회), 모델 카탈로그·캐시, CLI 경로 탐색 | 없음(프로세스 실행만) |
+| `ct-core` | 설정 모델·저장, 개인 사전 로드·저장·마스킹·복원, 언어 판별, `resolve_plan`, `compose_replacement`, `LlmProvider` trait과 요청·응답 타입(서비스가 쓰므로 core에 둔다. 순환 의존 방지), 번역·설명·교정 서비스, 교정 규칙, 파일 문제 수집 | 없음 |
+| `ct-llm` | `LlmProvider` 구현: `MockProvider`, `ClaudeCliProvider`(프롬프트, JSON 검증), `ClaudeCliClient`(상주 프로세스, stream-json, 타임아웃, `/clear` 주기, 재시작, `initialize` 모델 조회), 모델 카탈로그·캐시, CLI 경로 탐색 | 없음(프로세스 실행만) |
 | `ct-sheets` | 셀 모델, 클립보드 HTML 파서, 지원 판정, 교체 페이로드, 쓰기 후 검증, 결과 분류, 라우팅 | 없음 |
 | `ct-win` | 저수준 키보드 훅(F15 주입), 코드 라우터(Alt+Alt / Ctrl+Ctrl / 교차 조합, 키 반복 무시, 변경자 상태 규칙 D7), UIA 캡처·교체, Chrome 앱별 전략, 역할 분류, 클립보드(다중 포맷 보존·복원), Sheets 백엔드, 레지스트리 | 있음 |
 | `ct-app` (bin) | 조립, 트레이, Slint 창, 작업 디스패치 | 있음 |
@@ -268,11 +268,12 @@ tokio를 쓰지 않는다. `std::thread`와 채널로 구성한다.
 - 개인 사전 형식은 v5 `user.yaml`과 같다.
 
   ```yaml
-  - term: DA
-    action: KEEP
-  - term: logical model
-    action: TRANSLATE
-    translations: { ko: 논리 모델, en: logical model, vi: mô hình logic, ja: 論理モデル }
+  entries:
+    - term: DA
+      action: KEEP
+    - term: logical model
+      action: TRANSLATE
+      translations: { ko: 논리 모델, en: logical model, vi: mô hình logic, ja: 論理モデル }
   ```
 
 - 같은 표기가 두 항목에 있으면 파일에서 앞에 있는 항목이 이긴다.
