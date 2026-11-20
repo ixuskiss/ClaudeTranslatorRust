@@ -69,8 +69,15 @@ fn provider_overrides(s: &UserSettings) -> ProviderOverrides {
 }
 
 /// Seconds (Settings) to the milliseconds the double-press detectors read (P1).
+/// Clamped to 0.1..=2.0 s (R9); NaN falls back to the default 0.2 s.
 fn interval_ms(seconds: f64) -> u64 {
-    (seconds * 1000.0).round().max(0.0) as u64
+    const DEFAULT_SECONDS: f64 = 0.2;
+    let seconds = if seconds.is_nan() {
+        DEFAULT_SECONDS
+    } else {
+        seconds.clamp(0.1, 2.0)
+    };
+    (seconds * 1000.0).round() as u64
 }
 
 /// Settings after a tray Target click, or `None` when the toggle changes nothing (the base
@@ -646,7 +653,18 @@ mod tests {
         assert_eq!(interval_ms(0.3), 300);
         assert_eq!(interval_ms(0.45), 450);
         assert_eq!(interval_ms(1.0), 1000);
-        assert_eq!(interval_ms(-1.0), 0);
+    }
+
+    #[test]
+    fn interval_seconds_are_clamped_and_nan_uses_default() {
+        assert_eq!(interval_ms(-1.0), 100);
+        assert_eq!(interval_ms(0.0), 100);
+        assert_eq!(interval_ms(0.05), 100);
+        assert_eq!(interval_ms(2.0), 2000);
+        assert_eq!(interval_ms(5.0), 2000);
+        assert_eq!(interval_ms(f64::INFINITY), 2000);
+        assert_eq!(interval_ms(f64::NEG_INFINITY), 100);
+        assert_eq!(interval_ms(f64::NAN), 200);
     }
 
     #[test]
