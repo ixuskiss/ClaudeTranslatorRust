@@ -117,23 +117,29 @@ pub fn bring_to_front(hwnd: HWND) {
     }
 }
 
-/// Non-modal warning box: `MessageBoxW` runs on its own thread so the caller never blocks.
-pub fn message_box(title: &str, text: &str) {
+/// Warning box that blocks the calling thread until the user closes it. Used before the
+/// process exits (second instance), where a background thread would die with the process.
+pub fn message_box_blocking(title: &str, text: &str) {
     let title = HSTRING::from(title);
     let text = HSTRING::from(text);
+    // SAFETY: both strings outlive the call; no owner window.
+    unsafe {
+        MessageBoxW(
+            None,
+            &text,
+            &title,
+            MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// Non-modal warning box: `MessageBoxW` runs on its own thread so the caller never blocks.
+pub fn message_box(title: &str, text: &str) {
+    let title = title.to_string();
+    let text = text.to_string();
     let spawned = std::thread::Builder::new()
         .name("message-box".into())
-        .spawn(move || {
-            // SAFETY: both strings outlive the call; no owner window.
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &text,
-                    &title,
-                    MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
-                );
-            }
-        });
+        .spawn(move || message_box_blocking(&title, &text));
     if let Err(e) = spawned {
         tracing::error!(error = %e, "message_box: thread spawn failed");
     }

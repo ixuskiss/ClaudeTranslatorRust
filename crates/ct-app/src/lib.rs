@@ -2,4 +2,5 @@
 
 pub mod dispatch;
 pub mod flows;
+pub mod logging;
 pub mod ui;
