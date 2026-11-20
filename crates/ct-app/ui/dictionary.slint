@@ -1,0 +1,173 @@
+// Personal dictionary window (v5 §4.5). State lives in Rust (`ui/dictionary.rs`).
+import { Button, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct DictRow {
+    term: string,
+    action: string,
+    translations: string,
+    selected: bool,
+}
+
+component FormRow inherits HorizontalLayout {
+    in property <string> title;
+    spacing: 12px;
+
+    Text {
+        text: root.title;
+        width: 80px;
+        font-weight: 700;
+        color: #2B2B2B;
+        vertical-alignment: center;
+    }
+
+    @children
+}
+
+component Cell inherits Text {
+    color: #2B2B2B;
+    overflow: elide;
+    vertical-alignment: center;
+}
+
+export component DictionaryWin inherits Window {
+    in property <[DictRow]> rows;
+    in property <[string]> action-items;
+    in-out property <string> term;
+    in-out property <int> action-index;
+    in-out property <string> ko;
+    in-out property <string> en;
+    in-out property <string> vi;
+    in-out property <string> ja;
+    in property <string> error-text;
+    callback row-selected(int);
+    callback add();
+    callback update();
+    callback delete();
+
+    title: "ClaudeTranslator - Personal Dictionary";
+    background: #FBEEEC;
+    min-width: 520px;
+    min-height: 520px;
+    preferred-width: 640px;
+    preferred-height: 620px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+
+        // Table: header + selectable rows.
+        Rectangle {
+            background: #FFFFFF;
+            border-radius: 10px;
+            vertical-stretch: 1;
+            min-height: 160px;
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 0px;
+
+                HorizontalLayout {
+                    height: 26px;
+                    spacing: 8px;
+                    Cell { text: "Term"; font-weight: 700; horizontal-stretch: 2; }
+                    Cell { text: "Action"; font-weight: 700; horizontal-stretch: 1; }
+                    Cell { text: "Translations"; font-weight: 700; horizontal-stretch: 4; }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: #F0DEDC;
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        for row[i] in root.rows: Rectangle {
+                            height: 26px;
+                            background: row.selected ? #F5D9D5 : transparent;
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Cell { text: row.term; horizontal-stretch: 2; }
+                                Cell { text: row.action; horizontal-stretch: 1; }
+                                Cell { text: row.translations; horizontal-stretch: 4; }
+                            }
+
+                            TouchArea {
+                                clicked => {
+                                    root.row-selected(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        FormRow {
+            title: "Term";
+            LineEdit {
+                text <=> root.term;
+            }
+        }
+
+        FormRow {
+            title: "Action";
+            ComboBox {
+                model: root.action-items;
+                current-index <=> root.action-index;
+            }
+        }
+
+        FormRow {
+            title: "ko";
+            LineEdit { text <=> root.ko; }
+        }
+
+        FormRow {
+            title: "en";
+            LineEdit { text <=> root.en; }
+        }
+
+        FormRow {
+            title: "vi";
+            LineEdit { text <=> root.vi; }
+        }
+
+        FormRow {
+            title: "ja";
+            LineEdit { text <=> root.ja; }
+        }
+
+        Text {
+            text: root.error-text;
+            color: #C0392B;
+            wrap: word-wrap;
+            min-height: 20px;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Button {
+                text: "Add";
+                clicked => {
+                    root.add();
+                }
+            }
+
+            Button {
+                text: "Update";
+                clicked => {
+                    root.update();
+                }
+            }
+
+            Button {
+                text: "Delete";
+                clicked => {
+                    root.delete();
+                }
+            }
+        }
+    }
+}

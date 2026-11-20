@@ -9,15 +9,17 @@ mod generated {
 }
 
 pub mod badge;
+pub mod dictionary;
 pub mod explain;
 pub mod settings;
 pub mod tray;
 pub mod win32;
 
 pub(crate) use generated::{
-    BadgeWin, ExplainCard, ExplainLine, ExplainWin, SettingsWin, TargetRow,
+    BadgeWin, DictRow, DictionaryWin, ExplainCard, ExplainLine, ExplainWin, SettingsWin, TargetRow,
 };
 
 pub use badge::BadgeWindow;
+pub use dictionary::DictionaryWindow;
 pub use explain::ExplainWindow;
 pub use settings::SettingsWindow;
