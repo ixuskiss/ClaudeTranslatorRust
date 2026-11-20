@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod compose;
 pub mod config;
 pub mod detector;
 pub mod dictionary;
 pub mod file_problems;
 pub mod lang;
 pub mod paths;
+pub mod plan;
 pub mod settings;
 
 pub use lang::Lang;
@@ -14,6 +16,7 @@ pub use settings::{
     toggle_target, with_base,
 };
 
+pub use compose::compose_replacement;
 pub use config::{
     AppConfig, ClaudeCliConfig, LlmProviderKind, SheetsConfig, load_app_config,
     load_app_config_from_environment,
@@ -25,3 +28,4 @@ pub use dictionary::{
 };
 pub use file_problems::file_problems_warning;
 pub use paths::user_data_dir;
+pub use plan::{TranslationPlan, resolve_plan};
