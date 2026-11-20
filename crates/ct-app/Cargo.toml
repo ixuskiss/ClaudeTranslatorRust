@@ -11,9 +11,9 @@ ct-win = { path = "../ct-win" }
 tracing.workspace = true
 crossbeam-channel.workspace = true
 raw-window-handle = "0.6.2"
-slint = { version = "1.19.0", features = ["raw-window-handle-06"] }
+slint = { version = "1.19.0", features = ["raw-window-handle-06", "unstable-winit-030"] }
 tray-icon = "0.26.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_System_Threading"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_System_Threading"] }
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 

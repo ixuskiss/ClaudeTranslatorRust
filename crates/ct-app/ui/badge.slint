@@ -1,0 +1,19 @@
+// "Translating..." badge (v5 §4.7): background #fff3cd, color #333, padding 4px 8px.
+// Shown only through Win32 (SW_SHOWNOACTIVATE) so it never takes focus.
+export component BadgeWin inherits Window {
+    in property <string> text: "Translating...";
+    out property <length> content-width: label.preferred-width + 16px;
+    out property <length> content-height: label.preferred-height + 8px;
+    title: "ClaudeTranslator";
+    no-frame: true;
+    always-on-top: true;
+    background: #fff3cd;
+    width: root.content-width;
+    height: root.content-height;
+    label := Text {
+        text: root.text;
+        color: #333333;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

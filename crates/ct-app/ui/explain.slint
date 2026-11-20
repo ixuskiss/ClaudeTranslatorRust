@@ -1,0 +1,243 @@
+// Ctrl+Ctrl explanation window (v5 §4.6, palette §4.1).
+import { ScrollView } from "std-widgets.slint";
+
+export struct ExplainLine {
+    tag: string,
+    text: string,
+}
+
+export struct ExplainCard {
+    original: string,
+    translations: [ExplainLine],
+}
+
+// Invisible strip along an edge or corner that starts a native resize in `dir`.
+component Edge inherits TouchArea {
+    in property <string> dir;
+    callback resize(string);
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+            root.resize(root.dir);
+        }
+    }
+}
+
+export component ExplainWin inherits Window {
+    in property <string> status;
+    in property <[ExplainCard]> cards;
+    out property <length> content-width: column.preferred-width;
+    out property <length> content-height: column.preferred-height;
+    callback close-requested();
+    callback drag-requested();
+    callback resize-requested(string);
+
+    title: "ClaudeTranslator - Explanation";
+    no-frame: true;
+    background: transparent;
+    min-width: 480px;
+    min-height: 240px;
+    preferred-width: 480px;
+    preferred-height: 240px;
+    forward-focus: keys;
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close-requested();
+                return accept;
+            }
+            return reject;
+        }
+
+        Rectangle {
+            background: #FBEEEC;
+            border-radius: 14px;
+
+            // Left-press anywhere outside the content drags the window.
+            TouchArea {
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                        root.drag-requested();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    Text {
+                        text: "ClaudeTranslator";
+                        font-weight: 700;
+                        color: #8A8A8A;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        Text {
+                            text: "✕";
+                            color: #8A8A8A;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                root.close-requested();
+                            }
+                        }
+                    }
+                }
+
+                if root.status != "": Text {
+                    text: root.status;
+                    color: #2B2B2B;
+                    wrap: word-wrap;
+                }
+
+                sv := ScrollView {
+                    vertical-stretch: 1;
+                    content-width: self.visible-width;
+                    content-height: column.preferred-height;
+                    column := VerticalLayout {
+                        width: sv.visible-width;
+                        spacing: 10px;
+                        alignment: start;
+                        for card in root.cards: Rectangle {
+                            background: #FFFFFF;
+                            border-radius: 10px;
+                            VerticalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                spacing: 4px;
+                                TextInput {
+                                    text: card.original;
+                                    read-only: true;
+                                    single-line: false;
+                                    wrap: word-wrap;
+                                    font-weight: 700;
+                                    color: #2B2B2B;
+                                }
+
+                                for line in card.translations: VerticalLayout {
+                                    if line.tag != "": Text {
+                                        text: line.tag;
+                                        font-size: 10px;
+                                        color: #8A8A8A;
+                                    }
+                                    TextInput {
+                                        text: line.text;
+                                        read-only: true;
+                                        single-line: false;
+                                        wrap: word-wrap;
+                                        font-weight: 700;
+                                        color: #2563EB;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "닫기 Esc";
+                    color: #8A8A8A;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+
+        // 6 px resize zones; corners last so they win over the edges.
+        Edge {
+            x: 0;
+            y: 6px;
+            width: 6px;
+            height: root.height - 12px;
+            mouse-cursor: ew-resize;
+            dir: "w";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: root.width - 6px;
+            y: 6px;
+            width: 6px;
+            height: root.height - 12px;
+            mouse-cursor: ew-resize;
+            dir: "e";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: 6px;
+            y: 0;
+            width: root.width - 12px;
+            height: 6px;
+            mouse-cursor: ns-resize;
+            dir: "n";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: 6px;
+            y: root.height - 6px;
+            width: root.width - 12px;
+            height: 6px;
+            mouse-cursor: ns-resize;
+            dir: "s";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: 0;
+            y: 0;
+            width: 6px;
+            height: 6px;
+            mouse-cursor: nwse-resize;
+            dir: "nw";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: root.width - 6px;
+            y: root.height - 6px;
+            width: 6px;
+            height: 6px;
+            mouse-cursor: nwse-resize;
+            dir: "se";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: root.width - 6px;
+            y: 0;
+            width: 6px;
+            height: 6px;
+            mouse-cursor: nesw-resize;
+            dir: "ne";
+            resize(d) => { root.resize-requested(d); }
+        }
+
+        Edge {
+            x: 0;
+            y: root.height - 6px;
+            width: 6px;
+            height: 6px;
+            mouse-cursor: nesw-resize;
+            dir: "sw";
+            resize(d) => { root.resize-requested(d); }
+        }
+    }
+}
