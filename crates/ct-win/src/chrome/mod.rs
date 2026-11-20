@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod role;
 pub mod strategy;
+pub mod uia_backend;
 
 pub use adapter::{
     CapturedText, ChromeAdapter, ReplaceError, RetryingInteraction, TextInteraction, UiaBackend,
@@ -14,3 +15,4 @@ pub use role::{
 pub use strategy::{
     EditingContext, FocusedElement, READ_ONLY_STRATEGIES, REPLACE_STRATEGIES, Strategy,
 };
+pub use uia_backend::{WindowsUiaBackend, cursor_position};
