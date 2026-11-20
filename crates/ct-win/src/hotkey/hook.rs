@@ -100,6 +100,14 @@ fn send_key(vk: VIRTUAL_KEY, up: bool) {
     }
 }
 
+/// on_key 패닉을 여기서 막는다. F15 down을 이미 보낸 뒤라도 handle_event가
+/// request_f15를 반환해야 F15 up 스레드가 돌아 F15가 눌린 채로 남지 않는다.
+fn call_on_key(on_key: &mut OnKey, m: Modifier, dir: KeyDirection, now: Instant) {
+    if catch_unwind(AssertUnwindSafe(|| on_key(m, dir, now))).is_err() {
+        tracing::error!("keyboard hook on_key callback panicked");
+    }
+}
+
 /// 콜백 본문. F15 up을 예약해야 하면 true를 반환한다(F15 down은 이미 보냈다).
 fn handle_event(vk: u32, is_down: bool) -> bool {
     let key = classify_vk(vk);
@@ -129,7 +137,7 @@ fn handle_event(vk: u32, is_down: bool) -> bool {
             RawKey::Other => None,
         };
         if let Some(m) = modifier {
-            (st.on_key)(m, dir, now);
+            call_on_key(&mut st.on_key, m, dir, now);
         }
         request_f15
     })
@@ -307,5 +315,22 @@ mod tests {
         assert_eq!(classify_vk(0x11), RawKey::Ctrl);
         assert_eq!(classify_vk(0x41), RawKey::Other);
         assert_eq!(classify_vk(0xA0), RawKey::Other); // LSHIFT
+    }
+
+    #[test]
+    fn on_key_panic_is_contained_and_callback_stays_usable() {
+        // F15 down이 이미 나간 뒤 on_key가 패닉해도 handle_event가 끝까지 가서
+        // request_f15를 돌려줘야 한다(그래야 F15 up 스레드가 돈다).
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let mut on_key: OnKey = Box::new(move |_, _, _| {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("boom");
+            }
+        });
+        let now = Instant::now();
+        call_on_key(&mut on_key, Modifier::Alt, KeyDirection::Up, now);
+        call_on_key(&mut on_key, Modifier::Alt, KeyDirection::Up, now);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
