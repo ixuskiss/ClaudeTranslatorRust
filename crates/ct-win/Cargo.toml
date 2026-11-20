@@ -1,0 +1,24 @@
+[package]
+name = "ct-win"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ct-core = { path = "../ct-core" }
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_Security",
+] }
