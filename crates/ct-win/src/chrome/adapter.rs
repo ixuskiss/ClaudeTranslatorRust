@@ -1,7 +1,8 @@
 //! Chrome 어댑터와 캡처 재시도 (v5 참조 §2.4, §2.5).
 //!
-//! 교체 직전에 포커스를 다시 조사해 캡처 때와 같은 앱·필드인지 확인하고,
-//! 달라졌으면 아무것도 건드리지 않고 중단한다. 텍스트는 로그에 남기지 않는다.
+//! 교체 직전에 포커스를 다시 조사해 캡처 때와 같은 앱·필드인지, 선택이 남아 있는지
+//! (선택 없이 캡처했으면 필드 텍스트가 그대로인지) 확인하고, 달라졌으면 아무것도
+//! 건드리지 않고 중단한다. 텍스트는 로그에 남기지 않는다.
 
 use std::sync::Arc;
 use std::thread::sleep;
@@ -67,6 +68,19 @@ impl ChromeAdapter {
     }
 }
 
+/// 교체를 중단해야 하면 true (R7). 앱·필드가 다르거나, 캡처 때 있던 선택이 사라졌거나,
+/// 선택 없이 캡처한 필드의 텍스트가 바뀌었으면 원문을 보호하려고 붙여넣지 않는다.
+fn context_changed(captured: &EditingContext, now: &EditingContext) -> bool {
+    if now.app != captured.app || now.field_id != captured.field_id {
+        return true;
+    }
+    if captured.has_selection {
+        !now.has_selection
+    } else {
+        now.text != captured.text
+    }
+}
+
 impl TextInteraction for ChromeAdapter {
     fn capture(&self) -> Option<CapturedText> {
         let focused = self.backend.focused_element()?;
@@ -86,8 +100,7 @@ impl TextInteraction for ChromeAdapter {
         let now = strategy
             .identify_context(&focused)
             .ok_or(ReplaceError::ContextChanged)?;
-        // 앱과 필드만 비교한다. 번역 중 텍스트나 선택 여부가 바뀌어도 같은 필드면 교체한다.
-        if now.app != captured.context.app || now.field_id != captured.context.field_id {
+        if context_changed(&captured.context, &now) {
             return Err(ReplaceError::ContextChanged);
         }
         let has_selection = captured.context.has_selection;
@@ -339,13 +352,35 @@ mod tests {
     }
 
     #[test]
-    fn replace_compares_only_app_and_field() {
-        let mut changed = chat(Some("different"));
-        changed.full_text = "totally different".into();
+    fn replace_aborts_when_selection_collapsed_during_translation() {
+        // 캡처 때 선택이 있었는데 교체 직전에는 선택이 없다(같은 필드 안을 클릭함).
+        let (a, backend, _) = adapter(vec![Some(chat(Some("hello"))), Some(chat(None))]);
+        let c = a.capture().unwrap();
+        assert_eq!(a.replace(&c, "new"), Err(ReplaceError::ContextChanged));
+        assert_eq!(backend.paste_count(), 0);
+    }
+
+    #[test]
+    fn replace_aborts_when_field_text_changed_without_selection() {
+        let mut changed = chat(None);
+        changed.full_text = "hello world, edited".into();
         let (a, backend, _) = adapter(vec![Some(chat(None)), Some(changed)]);
         let c = a.capture().unwrap();
+        assert_eq!(a.replace(&c, "new"), Err(ReplaceError::ContextChanged));
+        assert_eq!(backend.paste_count(), 0);
+    }
+
+    #[test]
+    fn replace_pastes_when_context_unchanged() {
+        // 선택 있음: 같은 필드에 선택이 남아 있으면 교체한다.
+        let (a, backend, _) = adapter(vec![Some(chat(Some("hello"))), Some(chat(Some("hello")))]);
+        let c = a.capture().unwrap();
         assert_eq!(a.replace(&c, "new"), Ok(()));
-        // 캡처 당시(선택 없음) 기준으로 전체 교체한다.
+        assert_eq!(backend.pastes.lock().unwrap()[0].0, "selection");
+        // 선택 없음: 필드 텍스트가 같으면 전체 교체한다.
+        let (a, backend, _) = adapter(vec![Some(chat(None)), Some(chat(None))]);
+        let c = a.capture().unwrap();
+        assert_eq!(a.replace(&c, "new"), Ok(()));
         assert_eq!(backend.pastes.lock().unwrap()[0].0, "full");
     }
 
