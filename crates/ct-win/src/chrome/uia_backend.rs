@@ -105,11 +105,14 @@ impl UiaBackend for WindowsUiaBackend {
                 }
                 sleep(ESCAPE_RECOVERY_DELAY);
             }
-            if let Some((n, ct)) = window.focused() {
-                name = n;
-                control_type = ct;
-                role = classify_focused_role(&url, &name, control_type);
-            }
+            // 복구 뒤 포커스를 다시 못 읽으면 툴바 버튼에 Ctrl+C를 보내지 않고 중단한다(v5 §2.6 1e/1g).
+            let Some((n, ct)) = window.focused() else {
+                tracing::debug!(recovered, "toolbar focus recovery: focus unreadable");
+                return None;
+            };
+            name = n;
+            control_type = ct;
+            role = classify_focused_role(&url, &name, control_type);
             tracing::debug!(recovered, ?role, "toolbar focus recovery");
         }
 
