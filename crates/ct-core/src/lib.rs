@@ -6,9 +6,12 @@ pub mod detector;
 pub mod dictionary;
 pub mod file_problems;
 pub mod lang;
+pub mod llm;
 pub mod paths;
 pub mod plan;
 pub mod settings;
+#[cfg(test)]
+mod test_support;
 
 pub use lang::Lang;
 pub use settings::{
@@ -27,5 +30,10 @@ pub use dictionary::{
     save_dictionary_file,
 };
 pub use file_problems::file_problems_warning;
+pub use llm::{
+    CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult,
+    ExplanationSentence, LlmError, LlmProvider, TranslationRequest, TranslationResult,
+    parse_json_response, parse_language_map,
+};
 pub use paths::user_data_dir;
 pub use plan::{TranslationPlan, resolve_plan};

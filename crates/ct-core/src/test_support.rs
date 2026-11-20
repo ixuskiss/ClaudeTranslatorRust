@@ -1,0 +1,152 @@
+//! Test helpers shared across ct-core unit tests.
+
+use crate::llm::{
+    CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult, LlmError,
+    LlmProvider, TranslationRequest, TranslationResult,
+};
+use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard};
+
+/// Scripted `LlmProvider`. Queue responses per method with `push_*` (chainable); each call
+/// pops the next one (an unscripted call returns `Err(LlmError("FakeLlm: no response queued"))`).
+/// Every request is recorded: read them with `*_requests()`, count with `*_calls()`.
+#[derive(Default)]
+pub(crate) struct FakeLlm {
+    translate: Mutex<Script<TranslationRequest, TranslationResult>>,
+    explain: Mutex<Script<ExplanationRequest, ExplanationResult>>,
+    correct: Mutex<Script<CorrectionRequest, String>>,
+    correct_sentences: Mutex<Script<CorrectionRequest, Vec<CorrectionSentence>>>,
+}
+
+struct Script<Req, Res> {
+    responses: VecDeque<Result<Res, LlmError>>,
+    requests: Vec<Req>,
+}
+
+impl<Req, Res> Default for Script<Req, Res> {
+    fn default() -> Self {
+        Self {
+            responses: VecDeque::new(),
+            requests: Vec::new(),
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn call<Req: Clone, Res>(m: &Mutex<Script<Req, Res>>, req: &Req) -> Result<Res, LlmError> {
+    let mut s = lock(m);
+    s.requests.push(req.clone());
+    s.responses
+        .pop_front()
+        .unwrap_or_else(|| Err(LlmError("FakeLlm: no response queued".into())))
+}
+
+macro_rules! accessors {
+    ($field:ident, $req:ty, $res:ty, $push:ident, $requests:ident, $calls:ident) => {
+        pub(crate) fn $push(&self, r: Result<$res, LlmError>) -> &Self {
+            lock(&self.$field).responses.push_back(r);
+            self
+        }
+        pub(crate) fn $requests(&self) -> Vec<$req> {
+            lock(&self.$field).requests.clone()
+        }
+        pub(crate) fn $calls(&self) -> usize {
+            lock(&self.$field).requests.len()
+        }
+    };
+}
+
+#[allow(dead_code)] // used by later tasks' tests
+impl FakeLlm {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    accessors!(
+        translate,
+        TranslationRequest,
+        TranslationResult,
+        push_translate,
+        translate_requests,
+        translate_calls
+    );
+    accessors!(
+        explain,
+        ExplanationRequest,
+        ExplanationResult,
+        push_explain,
+        explain_requests,
+        explain_calls
+    );
+    accessors!(
+        correct,
+        CorrectionRequest,
+        String,
+        push_correct,
+        correct_requests,
+        correct_calls
+    );
+    accessors!(
+        correct_sentences,
+        CorrectionRequest,
+        Vec<CorrectionSentence>,
+        push_correct_sentences,
+        correct_sentences_requests,
+        correct_sentences_calls
+    );
+}
+
+impl LlmProvider for FakeLlm {
+    fn translate(&self, req: &TranslationRequest) -> Result<TranslationResult, LlmError> {
+        call(&self.translate, req)
+    }
+    fn explain(&self, req: &ExplanationRequest) -> Result<ExplanationResult, LlmError> {
+        call(&self.explain, req)
+    }
+    fn correct(&self, req: &CorrectionRequest) -> Result<String, LlmError> {
+        call(&self.correct, req)
+    }
+    fn correct_sentences(
+        &self,
+        req: &CorrectionRequest,
+    ) -> Result<Vec<CorrectionSentence>, LlmError> {
+        call(&self.correct_sentences, req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::Lang;
+    use crate::settings::{CorrectionMode, Tone};
+
+    #[test]
+    fn fake_llm_pops_in_order_and_records_requests() {
+        let fake = FakeLlm::new();
+        fake.push_translate(Ok(TranslationResult {
+            translations: vec![(Lang::En, "Hi".into())],
+        }))
+        .push_translate(Err(LlmError("boom".into())));
+        let req = TranslationRequest {
+            text: "안녕".into(),
+            source: Lang::Ko,
+            destinations: vec![Lang::En],
+            tone: Tone::Neutral,
+        };
+        assert!(fake.translate(&req).is_ok());
+        assert_eq!(fake.translate(&req), Err(LlmError("boom".into())));
+        assert!(fake.translate(&req).is_err());
+        assert_eq!(fake.translate_calls(), 3);
+        assert_eq!(fake.translate_requests()[0].destinations, vec![Lang::En]);
+        assert_eq!(fake.correct_calls(), 0);
+        let c = CorrectionRequest {
+            text: "x".into(),
+            mode: CorrectionMode::Spelling,
+        };
+        fake.push_correct(Ok("y".into()));
+        assert_eq!(fake.correct(&c).unwrap(), "y");
+    }
+}
