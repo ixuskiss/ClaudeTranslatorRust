@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod atomic_write;
 pub mod compose;
 pub mod config;
 pub mod correction;

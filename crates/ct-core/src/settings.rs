@@ -313,15 +313,16 @@ impl SettingsStore {
         &self.settings
     }
 
-    /// Replaces the in-memory settings, then persists them.
-    pub fn update(&mut self, settings: UserSettings) -> std::io::Result<()> {
-        self.settings = settings;
-        let yaml = serde_yaml::to_string(&Value::Mapping(to_mapping(&self.settings)))
+    /// Normalizes the targets against the base, persists atomically, and only then
+    /// replaces the in-memory settings (a failed write changes nothing).
+    pub fn update(&mut self, mut settings: UserSettings) -> std::io::Result<()> {
+        settings.target_languages =
+            normalize_targets(settings.base_language, &settings.target_languages);
+        let yaml = serde_yaml::to_string(&Value::Mapping(to_mapping(&settings)))
             .map_err(std::io::Error::other)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.path, yaml)
+        crate::atomic_write::write_atomic(&self.path, yaml.as_bytes())?;
+        self.settings = settings;
+        Ok(())
     }
 }
 
@@ -432,6 +433,66 @@ mod tests {
         let mut problems = Vec::new();
         let s = SettingsStore::load(&p, &mut problems).get().clone();
         (s, problems)
+    }
+
+    #[test]
+    fn update_normalizes_targets_and_persists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.yaml");
+        let mut store = SettingsStore::load(&p, &mut Vec::new());
+        let s = UserSettings {
+            base_language: Lang::Ko,
+            target_languages: vec![Lang::En, Lang::Ko, Lang::En],
+            ..UserSettings::default()
+        };
+        store.update(s).unwrap();
+        assert_eq!(store.get().target_languages, vec![Lang::En]);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let raw: Value = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(
+            raw["target_languages"],
+            Value::Sequence(vec![Value::String("en".into())])
+        );
+        let again = SettingsStore::load(&p, &mut Vec::new());
+        assert_eq!(again.get().target_languages, vec![Lang::En]);
+    }
+
+    #[test]
+    fn update_writes_atomically_without_leftover_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.yaml");
+        let mut store = SettingsStore::load(&p, &mut Vec::new());
+        store.update(UserSettings::default()).unwrap();
+        store
+            .update(UserSettings {
+                start_on_login: true,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        assert!(!dir.path().join("settings.yaml.tmp").exists());
+        assert!(
+            SettingsStore::load(&p, &mut Vec::new())
+                .get()
+                .start_on_login
+        );
+    }
+
+    #[test]
+    fn failed_update_keeps_file_and_memory_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.yaml");
+        let mut store = SettingsStore::load(&p, &mut Vec::new());
+        store.update(UserSettings::default()).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        // A directory where the temp file must go makes the write fail.
+        std::fs::create_dir(dir.path().join("settings.yaml.tmp")).unwrap();
+        let changed = UserSettings {
+            start_on_login: true,
+            ..UserSettings::default()
+        };
+        assert!(store.update(changed).is_err());
+        assert_eq!(store.get(), &UserSettings::default());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
     }
 
     #[test]

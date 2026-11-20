@@ -128,12 +128,8 @@ pub fn save_dictionary_file(path: &Path, entries: &[DictionaryEntry]) -> std::io
     root.insert("entries".into(), Value::Sequence(items));
     let text = serde_yaml::to_string(&Value::Mapping(root))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, text)
+    // tmp + rename: a crash mid-save can never truncate user.yaml.
+    crate::atomic_write::write_atomic(path, text.as_bytes())
 }
 
 #[cfg(test)]
@@ -356,5 +352,19 @@ mod tests {
         save_dictionary_file(&p, &[mk("OLD")]).unwrap();
         save_dictionary_file(&p, &[mk("NEW")]).unwrap();
         assert_eq!(load(&p).0, vec![mk("NEW")]);
+        assert!(!d.path().join("user.yaml.tmp").exists());
+    }
+
+    #[test]
+    fn failed_save_keeps_existing_file_intact() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("user.yaml");
+        let mk = |t: &str| DictionaryEntry::new(t.into(), Action::Keep, BTreeMap::new()).unwrap();
+        save_dictionary_file(&p, &[mk("OLD")]).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        // A directory where the temp file must go makes the write fail.
+        std::fs::create_dir(d.path().join("user.yaml.tmp")).unwrap();
+        assert!(save_dictionary_file(&p, &[mk("NEW")]).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
     }
 }

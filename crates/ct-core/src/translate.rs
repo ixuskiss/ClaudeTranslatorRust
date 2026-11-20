@@ -64,9 +64,20 @@ pub(crate) fn prepare(
     if text.trim().is_empty() {
         return Err(TranslateError::DirectionUnknown);
     }
+    // Base and duplicate targets are dropped (order kept). Unlike normalize_targets there
+    // is no fallback: nothing left means no safe direction, so no LLM call.
+    let mut filtered: Vec<Lang> = Vec::with_capacity(targets.len());
+    for &l in targets {
+        if l != base && !filtered.contains(&l) {
+            filtered.push(l);
+        }
+    }
+    if filtered.is_empty() {
+        return Err(TranslateError::DirectionUnknown);
+    }
     let masked = mask(text, entries);
     let detected = detector.detect(&masked.masked_text);
-    let plan = resolve_plan(detected, base, targets)
+    let plan = resolve_plan(detected, base, &filtered)
         .filter(|p| !p.destinations.is_empty())
         .ok_or(TranslateError::DirectionUnknown)?;
     Ok(Prepared {
@@ -219,6 +230,29 @@ mod tests {
                 (Lang::Ja, "論理モデルを確認".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn translate_drops_base_and_duplicate_targets() {
+        let llm = FakeLlm::new();
+        llm.push_translate(ok(&[(Lang::En, "check ⟦0⟧")]));
+        let out = run("논리 모델 확인", &llm, &[Lang::En, Lang::Ko, Lang::En]).unwrap();
+        assert_eq!(llm.translate_calls(), 1);
+        assert_eq!(llm.translate_requests()[0].destinations, vec![Lang::En]);
+        assert_eq!(
+            out.translations,
+            vec![(Lang::En, "check logical model".to_string())]
+        );
+    }
+
+    #[test]
+    fn translate_targets_only_base_fails_without_calling_llm() {
+        let llm = FakeLlm::new();
+        assert_eq!(
+            run("논리 모델 확인", &llm, &[Lang::Ko]),
+            Err(TranslateError::DirectionUnknown)
+        );
+        assert_eq!(llm.translate_calls(), 0);
     }
 
     #[test]
