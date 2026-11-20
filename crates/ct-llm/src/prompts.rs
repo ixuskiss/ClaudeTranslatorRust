@@ -37,6 +37,11 @@ const STRICT_FORMATTING_INSTRUCTION: &str = concat!(
     "words; never reformat, summarize, merge lines, or drop characters. "
 );
 const SOFT_FORMATTING_INSTRUCTION: &str = "Keep the same line breaks. ";
+/// Ruling R13: correction prompts must not use the translation-oriented strict line.
+const CORRECTION_FORMATTING_INSTRUCTION: &str = concat!(
+    "Keep the paragraph and line-break structure and non-alphabetic formatting ",
+    "(e.g. \"->\", bullet points, indentation) exactly; never summarize or drop characters. "
+);
 
 const SPELLING_INSTRUCTION: &str = concat!(
     "Fix only typos, spelling mistakes and Korean spacing (띄어쓰기) errors. ",
@@ -62,6 +67,14 @@ fn formatting_instruction(model: &str) -> &'static str {
         SOFT_FORMATTING_INSTRUCTION
     } else {
         STRICT_FORMATTING_INSTRUCTION
+    }
+}
+
+fn correction_formatting_instruction(model: &str) -> &'static str {
+    if model == "haiku" {
+        SOFT_FORMATTING_INSTRUCTION
+    } else {
+        CORRECTION_FORMATTING_INSTRUCTION
     }
 }
 
@@ -112,7 +125,7 @@ fn correction_preamble(mode: CorrectionMode) -> String {
     };
     format!(
         "Proofread the following Korean text. {instruction}Leave non-Korean words exactly as \
-         written. Preserve any tokens that look like ⟦N⟧ exactly as-is -- do not translate or \
+         written. Preserve any tokens that look like ⟦N⟧ exactly as-is -- do not change or \
          remove them. "
     )
 }
@@ -159,7 +172,7 @@ pub fn correction_prompt(req: &CorrectionRequest, model: &str) -> String {
         "{}{}{}Respond with only JSON matching this shape: {{\"corrected\": str}} \n\nText:\n{}",
         correction_preamble(req.mode),
         extra,
-        formatting_instruction(model),
+        correction_formatting_instruction(model),
         req.text
     )
 }
@@ -292,6 +305,54 @@ mod tests {
         assert!(!p.contains("merge or split"));
         assert!(p.contains("⟦N⟧"));
         assert!(p.contains(r#"{"sentences": [{"original": str, "corrected": str}]}"#));
+    }
+
+    const CORRECTION_FORMATTING: &str = "Keep the paragraph and line-break structure and \
+        non-alphabetic formatting (e.g. \"->\", bullet points, indentation) exactly; never \
+        summarize or drop characters. ";
+
+    #[test]
+    fn correction_prompts_use_correction_formatting_line() {
+        for mode in [CorrectionMode::Spelling, CorrectionMode::Polish] {
+            for model in ["sonnet", "", "opus"] {
+                let p = correction_prompt(&corr(mode), model);
+                assert!(p.contains(CORRECTION_FORMATTING), "{mode:?} {model}");
+                assert!(
+                    !p.contains("Keep the same line breaks."),
+                    "{mode:?} {model}"
+                );
+            }
+            let haiku = correction_prompt(&corr(mode), "haiku");
+            assert!(haiku.contains("Keep the same line breaks. "), "{mode:?}");
+            assert!(!haiku.contains(CORRECTION_FORMATTING), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn correction_prompts_never_mention_translation() {
+        for mode in [CorrectionMode::Spelling, CorrectionMode::Polish] {
+            for model in ["sonnet", "haiku", ""] {
+                let p = correction_prompt(&corr(mode), model).to_lowercase();
+                assert!(!p.contains("translate"), "{mode:?} {model}: {p}");
+            }
+            let p = sentence_correction_prompt(&corr(mode)).to_lowercase();
+            assert!(!p.contains("translate"), "{mode:?}: {p}");
+        }
+    }
+
+    #[test]
+    fn translation_prompt_keeps_strict_formatting_line() {
+        let p = translation_prompt(&req("x", Lang::En, &[Lang::Ko]), "sonnet");
+        assert!(p.contains(STRICT_FORMATTING_INSTRUCTION));
+        assert!(!p.contains(CORRECTION_FORMATTING));
+    }
+
+    #[test]
+    fn sentence_polish_prompt_bans_every_word() {
+        let p = sentence_correction_prompt(&corr(CorrectionMode::Polish));
+        for w in POLISH_BANNED_WORDS {
+            assert!(p.contains(w), "{w}");
+        }
     }
 
     #[test]
