@@ -19,31 +19,6 @@ fn skipped_entries_message(file_name: &str, count: usize) -> String {
     format!("{file_name}: 항목 {count}개를 읽지 못해 건너뛰었습니다.")
 }
 
-/// PyYAML(YAML 1.1)이 불리언으로 읽는 낱말. serde_yaml은 문자열로 읽으므로 v5와 맞추려고 버린다.
-fn is_yaml11_bool_word(s: &str) -> bool {
-    matches!(
-        s,
-        "yes"
-            | "Yes"
-            | "YES"
-            | "no"
-            | "No"
-            | "NO"
-            | "true"
-            | "True"
-            | "TRUE"
-            | "false"
-            | "False"
-            | "FALSE"
-            | "on"
-            | "On"
-            | "ON"
-            | "off"
-            | "Off"
-            | "OFF"
-    )
-}
-
 fn scalar_key(key: &Value) -> Option<String> {
     match key {
         Value::String(s) => Some(s.clone()),
@@ -60,7 +35,9 @@ fn clean_translations(raw: Option<&Value>) -> BTreeMap<String, String> {
     for (language, value) in map {
         let text = match value {
             Value::Number(n) => n.to_string(),
-            Value::String(s) if !is_yaml11_bool_word(s) => s.clone(),
+            // serde_yaml 0.9 reads unquoted On/Yes/No as strings (PyYAML: bool), so a hand-written
+            // `en: On` is kept here, unlike v5. Quoted "No"/"Yes" must survive a save/load round trip.
+            Value::String(s) => s.clone(),
             _ => continue,
         };
         if text.trim().is_empty() {
@@ -287,7 +264,7 @@ mod tests {
         let p = write_yaml(
             &d,
             "user.yaml",
-            "entries:\n  - term: year\n    action: TRANSLATE\n    translations:\n      ko: 연도\n      ja:\n      vi: \"\"\n      fr: \"   \"\n      en: On\n      de: 2024\n",
+            "entries:\n  - term: year\n    action: TRANSLATE\n    translations:\n      ko: 연도\n      ja:\n      vi: \"\"\n      fr: \"   \"\n      en: true\n      us: false\n      de: 2024\n",
         );
         let (e, _) = load(&p);
         assert_eq!(e.len(), 1);
@@ -300,7 +277,7 @@ mod tests {
         let p = write_yaml(
             &d,
             "user.yaml",
-            "entries:\n  - term: bad\n    action: TRANSLATE\n    translations:\n      en: Yes\n      ja:\n  - term: DA\n    action: KEEP\n",
+            "entries:\n  - term: bad\n    action: TRANSLATE\n    translations:\n      en: true\n      ja:\n  - term: DA\n    action: KEEP\n",
         );
         let (e, _) = load(&p);
         assert_eq!(terms(&e), ["DA"]);
@@ -327,6 +304,20 @@ mod tests {
         ];
         save_dictionary_file(&p, &entries).unwrap();
         assert!(std::fs::read_to_string(&p).unwrap().contains("entries:"));
+        let (loaded, problems) = load(&p);
+        assert!(problems.is_empty());
+        assert_eq!(loaded, entries);
+    }
+
+    #[test]
+    fn round_trips_yes_no_translation_values() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("user.yaml");
+        let entries = vec![
+            DictionaryEntry::new("ok".into(), Action::Translate, tr(&[("en", "Yes")])).unwrap(),
+            DictionaryEntry::new("no".into(), Action::Translate, tr(&[("en", "No")])).unwrap(),
+        ];
+        save_dictionary_file(&p, &entries).unwrap();
         let (loaded, problems) = load(&p);
         assert!(problems.is_empty());
         assert_eq!(loaded, entries);
