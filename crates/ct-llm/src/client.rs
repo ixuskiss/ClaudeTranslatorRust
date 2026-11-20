@@ -4,9 +4,13 @@
 //! one initialize request) is in flight on the process at a time. Each spawned process
 //! gets its own reader thread and its own channel: the thread parses stdout lines and
 //! sends `Some(event)` per JSON line, then `None` at EOF. Callers wait with a deadline
-//! (`recv_timeout`), so nothing blocks forever. Any failure tears the process down
-//! (stdin closed, child terminated, receiver dropped — the reader thread is never
-//! joined; it exits at stdout EOF or on its next failed send), so the next call starts
+//! (`recv_timeout`), so nothing blocks forever. Stdin is likewise owned by a per-process
+//! writer thread: callers hand it a line and wait for its acknowledgement within the same
+//! turn deadline, so a CLI that stops reading stdin cannot block a caller (or the lock).
+//! Any failure tears the process down (writer channel closed so stdin drops, child
+//! terminated, receiver dropped — neither thread is joined; the reader exits at stdout
+//! EOF or on its next failed send, the writer when its channel closes or a write fails
+//! after termination), so the next call starts
 //! a fresh process with a fresh channel and can never see a stale turn's events.
 //! Before reusing a live process, leftover events are drained so they can't be
 //! mistaken for the next turn's.
@@ -157,8 +161,28 @@ fn read_loop(stdout: Box<dyn Read + Send>, tx: Sender<Option<Value>>) {
     let _ = tx.send(None);
 }
 
+/// One stdin line for the writer thread plus where to acknowledge it.
+type WriteRequest = (Vec<u8>, Sender<Result<(), String>>);
+
+/// Writer thread body: owns stdin, writes each requested line and acknowledges it.
+/// Exits when the request channel closes (process torn down) or a write fails; a write
+/// blocked on a hung CLI is released when the child is terminated (broken pipe).
+fn write_loop(mut stdin: Box<dyn Write + Send>, requests: Receiver<WriteRequest>) {
+    for (line, ack) in requests {
+        let outcome = stdin
+            .write_all(&line)
+            .and_then(|()| stdin.flush())
+            .map_err(|e| e.to_string());
+        let failed = outcome.is_err();
+        let _ = ack.send(outcome);
+        if failed {
+            return;
+        }
+    }
+}
+
 struct Proc {
-    stdin: Box<dyn Write + Send>,
+    writer: Sender<WriteRequest>,
     child: Box<dyn ChildHandle>,
     events: Receiver<Option<Value>>,
 }
@@ -179,12 +203,13 @@ struct Inner {
 impl Inner {
     fn close(&mut self) {
         if let Some(Proc {
-            stdin,
+            writer,
             mut child,
             events,
         }) = self.proc.take()
         {
-            drop(stdin);
+            // Closing the request channel ends the writer thread, which drops stdin.
+            drop(writer);
             child.terminate();
             drop(events);
         }
@@ -210,17 +235,25 @@ impl Inner {
         } = spawner
             .spawn(args, cwd)
             .map_err(|e| CliError::Spawn(e.to_string()))?;
+        let (writer, requests) = crossbeam_channel::unbounded();
+        if let Err(e) = thread::Builder::new()
+            .name("claude-cli-writer".into())
+            .spawn(move || write_loop(stdin, requests))
+        {
+            child.terminate();
+            return Err(CliError::Spawn(e.to_string()));
+        }
         let (tx, events) = crossbeam_channel::unbounded();
         if let Err(e) = thread::Builder::new()
             .name("claude-cli-reader".into())
             .spawn(move || read_loop(stdout, tx))
         {
-            drop(stdin);
+            drop(writer);
             child.terminate();
             return Err(CliError::Spawn(e.to_string()));
         }
         self.proc = Some(Proc {
-            stdin,
+            writer,
             child,
             events,
         });
@@ -258,28 +291,44 @@ impl Inner {
     }
 
     fn next_event(&self, deadline: Instant) -> Result<Value, CliError> {
+        // Checked first so a CLI that keeps streaming non-result events (always one
+        // queued) cannot keep a turn alive past its deadline.
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(CliError::Timeout);
+        }
         let proc = self.proc.as_ref().ok_or(CliError::ProcessEnded)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match proc.events.recv_timeout(remaining) {
+        match proc.events.recv_timeout(deadline - now) {
             Ok(Some(event)) => Ok(event),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => Err(CliError::ProcessEnded),
             Err(RecvTimeoutError::Timeout) => Err(CliError::Timeout),
         }
     }
 
-    fn send(&mut self, message: String) -> Result<(), CliError> {
-        let proc = self.proc.as_mut().ok_or(CliError::ProcessEnded)?;
-        let mut line = message;
-        line.push('\n');
-        proc.stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| proc.stdin.flush())
-            .map_err(|e| CliError::Io(e.to_string()))
+    /// Hands one line to the writer thread and waits for its acknowledgement until
+    /// `deadline` (a CLI hung at boot stops reading stdin once the pipe buffer fills).
+    fn send(&mut self, message: String, deadline: Instant) -> Result<(), CliError> {
+        let proc = self.proc.as_ref().ok_or(CliError::ProcessEnded)?;
+        let mut line = message.into_bytes();
+        line.push(b'\n');
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        proc.writer
+            .send((line, ack_tx))
+            .map_err(|_| CliError::ProcessEnded)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match ack_rx.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CliError::Io(e)),
+            Err(RecvTimeoutError::Timeout) => Err(CliError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(CliError::ProcessEnded),
+        }
     }
 
-    /// Waits for exactly the next `result` event; everything else is skipped.
-    fn wait_for_result(&mut self, timeout: Duration) -> Result<Value, CliError> {
+    /// Sends one user turn and waits for exactly its `result` event (everything else
+    /// is skipped); the write and the wait share one deadline.
+    fn turn(&mut self, content: &str, timeout: Duration) -> Result<Value, CliError> {
         let deadline = deadline_after(timeout);
+        self.send(user_message(content), deadline)?;
         loop {
             let event = self.next_event(deadline)?;
             if event_type(&event) == Some("result") {
@@ -294,18 +343,15 @@ impl Inner {
         if every > 0 && self.turns_since_clear >= every {
             // /clear is a turn like any other: it ends with its own (empty) result event,
             // which must be consumed so it is never mistaken for the prompt's result.
-            self.send(user_message("/clear"))?;
-            self.wait_for_result(config.timeout)?;
+            self.turn("/clear", config.timeout)?;
             self.turns_since_clear = 0;
         }
-        self.send(user_message(prompt))?;
-        let event = self.wait_for_result(config.timeout)?;
+        let event = self.turn(prompt, config.timeout)?;
         self.turns_since_clear = self.turns_since_clear.saturating_add(1);
         Ok(event)
     }
 
-    fn await_models(&mut self, timeout: Duration) -> Result<Vec<ModelInfo>, CliError> {
-        let deadline = deadline_after(timeout);
+    fn await_models(&mut self, deadline: Instant) -> Result<Vec<ModelInfo>, CliError> {
         loop {
             let event = self.next_event(deadline)?;
             match parse_models_response(&event) {
@@ -378,18 +424,21 @@ impl ClaudeCliClient {
     pub fn list_models(&self, timeout: Duration) -> Result<Vec<ModelInfo>, CliError> {
         let mut inner = self.lock();
         self.start(&mut inner)?;
+        let deadline = deadline_after(timeout);
         match &inner.models {
             ModelsState::Ready(models) => return Ok(models.clone()),
             ModelsState::Pending => {}
             ModelsState::NotRequested => {
-                if let Err(e) = inner.send(initialize_request()) {
+                // A write that does not complete in time (hung CLI) tears down too.
+                if let Err(e) = inner.send(initialize_request(), deadline) {
+                    tracing::warn!(error = %e, "Claude CLI list_models write failed; process reset");
                     inner.close();
                     return Err(e);
                 }
                 inner.models = ModelsState::Pending;
             }
         }
-        match inner.await_models(timeout) {
+        match inner.await_models(deadline) {
             Ok(models) => Ok(models),
             Err(CliError::Timeout) => {
                 tracing::warn!("Claude CLI list_models timed out; keeping process");
@@ -476,7 +525,24 @@ mod tests {
     struct FakeSpawner {
         scripts: Vec<Script>,
         fail_spawns: Vec<usize>,
+        /// Spawn indexes whose stdin never accepts a write (until the child is terminated).
+        blocked_stdin: Vec<usize>,
         rec: Arc<Mutex<Record>>,
+    }
+
+    /// Stdin of a CLI hung at boot: every write blocks until the child is terminated,
+    /// then fails like a broken pipe.
+    struct BlockedStdin(Arc<AtomicBool>);
+    impl Write for BlockedStdin {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            while !self.0.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminated"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     struct FakeChild {
@@ -537,8 +603,13 @@ mod tests {
                 }
                 alive.store(false, Ordering::SeqCst);
             });
+            let stdin: Box<dyn Write + Send> = if self.blocked_stdin.contains(&idx) {
+                Box::new(BlockedStdin(terminated.clone()))
+            } else {
+                Box::new(in_w)
+            };
             Ok(SpawnedCli {
-                stdin: Box::new(in_w),
+                stdin,
                 stdout: Box::new(out_r),
                 child: Box::new(FakeChild {
                     running,
@@ -621,10 +692,20 @@ mod tests {
         scripts: Vec<Script>,
         fail_spawns: Vec<usize>,
     ) -> (ClaudeCliClient, Arc<Mutex<Record>>) {
+        make_blocked(config, scripts, fail_spawns, vec![])
+    }
+
+    fn make_blocked(
+        config: ClaudeCliConfig,
+        scripts: Vec<Script>,
+        fail_spawns: Vec<usize>,
+        blocked_stdin: Vec<usize>,
+    ) -> (ClaudeCliClient, Arc<Mutex<Record>>) {
         let rec = Arc::new(Mutex::new(Record::default()));
         let spawner = FakeSpawner {
             scripts,
             fail_spawns,
+            blocked_stdin,
             rec: rec.clone(),
         };
         (ClaudeCliClient::new(config, None, Arc::new(spawner)), rec)
@@ -733,6 +814,7 @@ mod tests {
         let spawner = FakeSpawner {
             scripts: vec![echo()],
             fail_spawns: vec![],
+            blocked_stdin: vec![],
             rec: rec.clone(),
         };
         let config = ClaudeCliConfig {
@@ -825,6 +907,72 @@ mod tests {
         // The next call restarts and gets its own turn's result, never t1's late one.
         assert_eq!(text(client.ask("t2")), "r:t2");
         assert_eq!(spawns(&rec), 2);
+    }
+
+    #[test]
+    fn blocked_stdin_write_times_out_and_next_call_restarts() {
+        let (client, rec) = make_blocked(cfg(200, 20), vec![echo()], vec![], vec![0]);
+        let start = Instant::now();
+        assert_eq!(client.ask("t1"), Err(CliError::Timeout));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(terminated(&rec, 0));
+        assert_eq!(text(client.ask("t2")), "r:t2");
+        assert_eq!(spawns(&rec), 2);
+    }
+
+    #[test]
+    fn blocked_stdin_initialize_times_out_and_tears_down() {
+        let (client, rec) = make_blocked(cfg(5000, 20), vec![echo()], vec![], vec![0]);
+        let start = Instant::now();
+        assert_eq!(
+            client.list_models(Duration::from_millis(200)),
+            Err(CliError::Timeout)
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(terminated(&rec, 0));
+        assert_eq!(text(client.ask("hi")), "r:hi");
+        assert_eq!(spawns(&rec), 2);
+    }
+
+    #[test]
+    fn endless_non_result_events_time_out() {
+        // The CLI streams non-result events as fast as it can and never ends the turn.
+        let flood: Script = Arc::new(|_, out| {
+            let line = format!("{}\n", json!({"type": "assistant", "message": {}}));
+            while out.0.write_all(line.as_bytes()).is_ok() {}
+            false
+        });
+        let (client, rec) = make(cfg(200, 20), vec![flood, echo()], vec![]);
+        let start = Instant::now();
+        assert_eq!(client.ask("t1"), Err(CliError::Timeout));
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(terminated(&rec, 0));
+        assert_eq!(text(client.ask("t2")), "r:t2");
+    }
+
+    #[test]
+    fn next_event_after_deadline_is_timeout_even_with_queued_events() {
+        let (tx, events) = crossbeam_channel::unbounded();
+        tx.send(Some(init_event())).unwrap();
+        let (writer, _writer_rx) = crossbeam_channel::unbounded();
+        let inner = Inner {
+            proc: Some(Proc {
+                writer,
+                child: Box::new(FakeChild {
+                    running: Arc::new(AtomicBool::new(true)),
+                    terminated: Arc::new(AtomicBool::new(false)),
+                }),
+                events,
+            }),
+            turns_since_clear: 0,
+            models: ModelsState::NotRequested,
+        };
+        let past = Instant::now();
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(inner.next_event(past), Err(CliError::Timeout));
     }
 
     #[test]
