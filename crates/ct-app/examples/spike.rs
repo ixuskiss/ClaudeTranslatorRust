@@ -23,10 +23,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LMENU, VK_MENU, VK_RMENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, CallNextHookEx, GWL_EXSTYLE, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
+    ShowWindow, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 use windows::core::BOOL;
 
@@ -180,7 +180,43 @@ fn hwnd_of(win: &slint::Window) -> Option<HWND> {
     }
 }
 
-fn show_badge(badge: &BadgeWin) {
+/// Creates the single badge window once. Slint only creates the HWND on the first
+/// `show()`, so it is shown once off-screen at startup, gets the no-activate/topmost/
+/// tool-window ex-styles, and is hidden again via Win32 (Slint still treats it as visible
+/// and keeps rendering it). Every later display goes through `show_badge`, never through
+/// Slint's `show()`.
+fn create_badge() -> Option<(BadgeWin, HWND)> {
+    let badge = match BadgeWin::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("S2: badge create failed: {e}");
+            return None;
+        }
+    };
+    badge
+        .window()
+        .set_position(slint::PhysicalPosition::new(-32000, -32000));
+    if let Err(e) = badge.show() {
+        eprintln!("S2: initial off-screen show failed: {e}");
+        return None;
+    }
+    let Some(hwnd) = hwnd_of(badge.window()) else {
+        eprintln!("S2: no HWND");
+        return None;
+    };
+    // SAFETY: hwnd belongs to our live window.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let add = (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | add);
+    }
+    println!("S2: badge created and styled while hidden");
+    Some((badge, hwnd))
+}
+
+/// Displays the already-styled badge near the cursor without activating it.
+fn show_badge(badge: &BadgeWin, hwnd: HWND) {
     let mut pt = POINT::default();
     // SAFETY: valid out pointer.
     if unsafe { GetCursorPos(&mut pt) }.is_ok() {
@@ -188,19 +224,10 @@ fn show_badge(badge: &BadgeWin) {
             .window()
             .set_position(slint::PhysicalPosition::new(pt.x + 16, pt.y + 16));
     }
-    if badge.show().is_err() {
-        eprintln!("S2: show failed");
-        return;
-    }
-    let Some(hwnd) = hwnd_of(badge.window()) else {
-        eprintln!("S2: no HWND");
-        return;
-    };
+    badge.window().request_redraw();
     // SAFETY: hwnd belongs to our live window.
     unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let add = (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | add);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let r = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -208,9 +235,16 @@ fn show_badge(badge: &BadgeWin) {
             0,
             0,
             0,
-            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
         );
         println!("S2: badge shown, SetWindowPos ok={}", r.is_ok());
+    }
+}
+
+fn hide_badge(hwnd: HWND) {
+    // SAFETY: hwnd belongs to our live window.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
     }
 }
 
@@ -274,7 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _tray = builder.build()?;
 
-    let badge: Rc<RefCell<Option<BadgeWin>>> = Rc::new(RefCell::new(None));
+    let badge: Rc<Option<(BadgeWin, HWND)>> = Rc::new(create_badge());
     let front: Rc<RefCell<Option<FrontWin>>> = Rc::new(RefCell::new(None));
     let (badge_id, front_id, exit_id) = (
         badge_item.id().clone(),
@@ -294,9 +328,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if ev.id == badge_id {
                     let badge = badge.clone();
                     slint::Timer::single_shot(Duration::from_secs(3), move || {
-                        if let Ok(w) = BadgeWin::new() {
-                            show_badge(&w);
-                            *badge.borrow_mut() = Some(w);
+                        if let Some((w, hwnd)) = badge.as_ref() {
+                            show_badge(w, *hwnd);
+                            // Hide again so the next click is a fresh show (S2: judge
+                            // from the 2nd show onward).
+                            let hwnd = *hwnd;
+                            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                                hide_badge(hwnd);
+                            });
+                        } else {
+                            eprintln!("S2: badge unavailable");
                         }
                     });
                 } else if ev.id == front_id {
