@@ -4,3 +4,5 @@ pub mod chrome;
 pub mod clipboard;
 pub mod hotkey;
 pub mod keys;
+pub mod registry;
+pub mod single_instance;
