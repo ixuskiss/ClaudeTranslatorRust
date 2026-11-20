@@ -19,14 +19,17 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LMENU, VK_MENU, VK_RMENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+    VIRTUAL_KEY, VK_F15, VK_LMENU, VK_MENU, VK_RMENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, CallNextHookEx, GWL_EXSTYLE, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
-    ShowWindow, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 use windows::core::BOOL;
 
@@ -58,40 +61,88 @@ static ALT_TX: OnceLock<Sender<()>> = OnceLock::new();
 
 struct AltState {
     down: bool,
+    /// Another (non-Alt) key went down while Alt was held (Alt+Tab, Alt+F4 ...).
+    combo_used: bool,
     last_release: Option<Instant>,
 }
 static ALT_STATE: Mutex<AltState> = Mutex::new(AltState {
     down: false,
+    combo_used: false,
     last_release: None,
 });
 
 const ALT_ALT_WINDOW: Duration = Duration::from_millis(200);
+/// v5 `_F15_RELEASE_DELAY_SECONDS`: F15 stays held across the real Alt-up.
+const F15_RELEASE_DELAY: Duration = Duration::from_millis(50);
 
 fn is_alt(vk: u32) -> bool {
     vk == u32::from(VK_MENU.0) || vk == u32::from(VK_LMENU.0) || vk == u32::from(VK_RMENU.0)
 }
 
+/// Injects one key event. `INPUT` from the `windows` crate has the real Win32 size, so
+/// `cbSize` is correct (v5's struct-size bug made every SendInput fail silently).
+fn send_key(vk: VIRTUAL_KEY, up: bool) -> bool {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    // SAFETY: one fully initialised INPUT with the correct cbSize.
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    sent == 1
+}
+
+/// Port of v5 `windows_keyboard_hook.py`: on a real *solo* Alt tap's key-up, press F15
+/// down BEFORE passing the Alt-up down the hook chain, and release F15 50 ms later on
+/// another thread. Chrome then sees "Alt ... F15 held, Alt up" (a combo) and does not
+/// move keyboard focus to its toolbar. Nothing is ever blocked; injected events
+/// (our own F15, LLKHF_INJECTED) are ignored for gesture detection.
 unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut release_f15 = false;
+    let mut f15_down_ok = false;
     if code >= 0 && lparam.0 != 0 {
         // SAFETY: for WH_KEYBOARD_LL with code >= 0, lparam points to a KBDLLHOOKSTRUCT.
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let injected = (info.flags & LLKHF_INJECTED).0 != 0;
         let msg = wparam.0 as u32;
         let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-        if let Ok(mut st) = ALT_STATE.lock() {
-            if is_alt(info.vkCode) {
-                if is_down {
-                    // Auto-repeat while held: already down, ignore.
-                    st.down = true;
-                } else if is_up && st.down {
-                    st.down = false;
+        if !injected && let Ok(mut st) = ALT_STATE.lock() {
+            let alt = is_alt(info.vkCode);
+            if is_down && !alt {
+                if st.down {
+                    st.combo_used = true;
+                }
+                // Any other key breaks the Alt-Alt sequence.
+                st.last_release = None;
+            }
+            if alt && is_down && !st.down {
+                st.down = true;
+                st.combo_used = false;
+            } else if alt && is_up && st.down {
+                st.down = false;
+                if st.combo_used {
+                    st.last_release = None;
+                } else {
+                    f15_down_ok = send_key(VK_F15, false);
+                    release_f15 = true;
                     let now = Instant::now();
                     let fire = st
                         .last_release
                         .is_some_and(|t| now.duration_since(t) <= ALT_ALT_WINDOW);
                     if fire {
                         st.last_release = None;
-                        println!("ALT_ALT");
                         if let Some(tx) = ALT_TX.get() {
                             let _ = tx.send(());
                         }
@@ -99,14 +150,21 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
                         st.last_release = Some(now);
                     }
                 }
-            } else if is_down {
-                // Any other key breaks the Alt-Alt sequence.
-                st.last_release = None;
             }
         }
     }
     // SAFETY: always forward to the next hook.
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    let result = unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    if release_f15 {
+        // Printing and the delayed release happen off the hook thread so the callback
+        // returns immediately (Windows drops LL hooks that block ~300 ms).
+        std::thread::spawn(move || {
+            std::thread::sleep(F15_RELEASE_DELAY);
+            let up_ok = send_key(VK_F15, true);
+            println!("S4: solo Alt tap -> F15 down ok={f15_down_ok} up ok={up_ok}");
+        });
+    }
+    result
 }
 
 fn spawn_hook_thread() {
@@ -157,6 +215,7 @@ fn spawn_uia_thread(rx: Receiver<()>) {
                 };
             println!("S5: UIA ready");
             while rx.recv().is_ok() {
+                println!("ALT_ALT");
                 match uia.GetFocusedElement() {
                     Ok(el) => {
                         // Never print the name itself, only its length.
@@ -171,26 +230,46 @@ fn spawn_uia_thread(rx: Receiver<()>) {
     });
 }
 
-fn hwnd_of(win: &slint::Window) -> Option<HWND> {
+fn hwnd_of(win: &slint::Window) -> Result<HWND, String> {
     let wh = win.window_handle();
-    let handle = wh.window_handle().ok()?;
+    let handle = wh.window_handle().map_err(|e| format!("{e:?}"))?;
     match handle.as_raw() {
-        RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut core::ffi::c_void)),
-        _ => None,
+        RawWindowHandle::Win32(h) => Ok(HWND(h.hwnd.get() as *mut core::ffi::c_void)),
+        other => Err(format!("not a Win32 handle: {other:?}")),
     }
 }
 
-/// Creates the single badge window once. Slint only creates the HWND on the first
-/// `show()`, so it is shown once off-screen at startup, gets the no-activate/topmost/
-/// tool-window ex-styles, and is hidden again via Win32 (Slint still treats it as visible
-/// and keeps rendering it). Every later display goes through `show_badge`, never through
-/// Slint's `show()`.
-fn create_badge() -> Option<(BadgeWin, HWND)> {
+/// Slint (winit backend) creates the native window lazily, on the event loop, after
+/// `show()` returns — asking for the HWND right after `show()` gets nothing (first spike
+/// run: "no HWND"). Retry every 50 ms for up to ~2 s, then report.
+const HWND_RETRIES: u32 = 40;
+
+fn wait_for_hwnd<G, D>(get: G, tries_left: u32, done: D)
+where
+    G: Fn() -> Result<HWND, String> + 'static,
+    D: FnOnce(Result<HWND, String>) + 'static,
+{
+    match get() {
+        Ok(h) => done(Ok(h)),
+        Err(e) if tries_left == 0 => done(Err(e)),
+        Err(_) => slint::Timer::single_shot(Duration::from_millis(50), move || {
+            wait_for_hwnd(get, tries_left - 1, done)
+        }),
+    }
+}
+
+type BadgeSlot = Rc<RefCell<Option<(BadgeWin, HWND)>>>;
+
+/// Creates the single badge window once (called after the event loop is running). It is
+/// shown once off-screen so the HWND exists, then hidden via Win32 and given the
+/// no-activate/topmost/tool-window ex-styles. Every later display goes through
+/// `show_badge`, never through Slint's `show()`.
+fn create_badge(slot: BadgeSlot) {
     let badge = match BadgeWin::new() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("S2: badge create failed: {e}");
-            return None;
+            return;
         }
     };
     badge
@@ -198,21 +277,27 @@ fn create_badge() -> Option<(BadgeWin, HWND)> {
         .set_position(slint::PhysicalPosition::new(-32000, -32000));
     if let Err(e) = badge.show() {
         eprintln!("S2: initial off-screen show failed: {e}");
-        return None;
+        return;
     }
-    let Some(hwnd) = hwnd_of(badge.window()) else {
-        eprintln!("S2: no HWND");
-        return None;
-    };
-    // SAFETY: hwnd belongs to our live window.
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let add = (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | add);
-    }
-    println!("S2: badge created and styled while hidden");
-    Some((badge, hwnd))
+    let probe = badge.clone_strong();
+    wait_for_hwnd(
+        move || hwnd_of(probe.window()),
+        HWND_RETRIES,
+        move |res| match res {
+            Ok(hwnd) => {
+                // SAFETY: hwnd belongs to our live window.
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    let add = (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | add);
+                }
+                println!("S2: badge created and styled while hidden");
+                *slot.borrow_mut() = Some((badge, hwnd));
+            }
+            Err(e) => eprintln!("S2: no HWND after retries: {e}"),
+        },
+    );
 }
 
 /// Displays the already-styled badge near the cursor without activating it.
@@ -253,12 +338,24 @@ fn bring_to_front(win: &FrontWin) {
         eprintln!("S3: show failed");
         return;
     }
-    let Some(hwnd) = hwnd_of(win.window()) else {
-        eprintln!("S3: no HWND");
-        return;
-    };
+    let probe = win.clone_strong();
+    wait_for_hwnd(
+        move || hwnd_of(probe.window()),
+        HWND_RETRIES,
+        |res| match res {
+            Ok(hwnd) => force_foreground(hwnd),
+            Err(e) => eprintln!("S3: no HWND after retries: {e}"),
+        },
+    );
+}
+
+fn force_foreground(hwnd: HWND) {
     // SAFETY: Win32 foreground calls on our own window.
     unsafe {
+        if GetForegroundWindow() == hwnd {
+            println!("S3: window was already in front when the HWND appeared");
+            return;
+        }
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let r: BOOL = SetForegroundWindow(hwnd);
         if r.as_bool() && GetForegroundWindow() == hwnd {
@@ -308,7 +405,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _tray = builder.build()?;
 
-    let badge: Rc<Option<(BadgeWin, HWND)>> = Rc::new(create_badge());
+    let badge: BadgeSlot = Rc::new(RefCell::new(None));
+    {
+        // Create the badge once the event loop runs, so Slint can realise its window.
+        let slot = badge.clone();
+        slint::Timer::single_shot(Duration::from_millis(100), move || create_badge(slot));
+    }
     let front: Rc<RefCell<Option<FrontWin>>> = Rc::new(RefCell::new(None));
     let (badge_id, front_id, exit_id) = (
         badge_item.id().clone(),
@@ -328,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if ev.id == badge_id {
                     let badge = badge.clone();
                     slint::Timer::single_shot(Duration::from_secs(3), move || {
-                        if let Some((w, hwnd)) = badge.as_ref() {
+                        if let Some((w, hwnd)) = badge.borrow().as_ref() {
                             show_badge(w, *hwnd);
                             // Hide again so the next click is a fresh show (S2: judge
                             // from the 2nd show onward).
@@ -337,7 +439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 hide_badge(hwnd);
                             });
                         } else {
-                            eprintln!("S2: badge unavailable");
+                            eprintln!("S2: badge unavailable (see the S2 line printed at startup)");
                         }
                     });
                 } else if ev.id == front_id {
