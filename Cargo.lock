@@ -970,6 +970,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "windows",
 ]
 
 [[package]]

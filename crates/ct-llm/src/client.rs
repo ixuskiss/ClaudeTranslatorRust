@@ -300,7 +300,13 @@ impl Inner {
         let proc = self.proc.as_ref().ok_or(CliError::ProcessEnded)?;
         match proc.events.recv_timeout(deadline - now) {
             Ok(Some(event)) => Ok(event),
-            Ok(None) | Err(RecvTimeoutError::Disconnected) => Err(CliError::ProcessEnded),
+            Ok(None) | Err(RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    stderr_tail_len = proc.child.stderr_tail_len(),
+                    "claude CLI process ended"
+                );
+                Err(CliError::ProcessEnded)
+            }
             Err(RecvTimeoutError::Timeout) => Err(CliError::Timeout),
         }
     }
@@ -557,6 +563,9 @@ mod tests {
         fn terminate(&mut self) {
             self.terminated.store(true, Ordering::SeqCst);
             self.running.store(false, Ordering::SeqCst);
+        }
+        fn stderr_tail_len(&self) -> usize {
+            0
         }
     }
 
