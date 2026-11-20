@@ -11,8 +11,7 @@ use ct_core::{
     normalize_targets, with_base,
 };
 use ct_llm::{
-    CatalogSource, ListenerId, ModelCatalog, ModelInfo, home_dir, resolve_claude_cli_path,
-    which_on_path,
+    CatalogSource, ListenerId, ModelCatalog, ModelInfo, home_dir, resolve_claude_cli, which_on_path,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
@@ -569,7 +568,10 @@ impl SettingsWindow {
         let models = catalog.get();
         let form = SettingsForm::new(settings, &models);
         let s = &form.settings;
-        let detected = resolve_claude_cli_path(&s.claude_cli_path, &which_on_path, &home_dir());
+        let detected = resolve_claude_cli(&s.claude_cli_path, &which_on_path, &home_dir())
+            .program
+            .to_string_lossy()
+            .into_owned();
 
         win.set_base_items(strings(BASE_ITEMS.iter().map(|l| l.code().to_string())));
         win.set_base_index(

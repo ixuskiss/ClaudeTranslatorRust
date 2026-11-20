@@ -17,6 +17,8 @@ pub const MSG_REPLACE_FAILED: &str = "교체 대상이 바뀌어 원문을 변�
 pub const MSG_ALT_NO_SELECTION_DOCS: &str = "텍스트를 선택한 후 Alt+Alt를 눌러주세요.";
 pub const MSG_CTRL_NO_SELECTION: &str = "텍스트를 선택한 후 Ctrl+Ctrl을 실행해주세요.";
 pub const MSG_EXPLAIN_FAILED: &str = "Could not translate/explain the selected text";
+pub const MSG_CLI_UNAVAILABLE: &str =
+    "Claude CLI를 실행할 수 없습니다. Settings의 Claude CLI 경로를 확인하세요.";
 
 const LOADING_TEXT: &str = "Translating...";
 
@@ -71,9 +73,17 @@ fn replace_error_kind(e: &ReplaceError) -> &'static str {
     }
 }
 
+/// True when an LLM error message says the CLI process could not be started
+/// (`CliError::Spawn`, wrapped by the provider as "Claude CLI call failed: failed to start
+/// Claude CLI: ...").
+pub fn is_cli_start_failure(message: &str) -> bool {
+    message.contains("failed to start Claude CLI")
+}
+
 fn translate_error_message(e: &TranslateError) -> &'static str {
     match e {
         TranslateError::DirectionUnknown => MSG_DIRECTION_UNKNOWN,
+        TranslateError::Llm(m) if is_cli_start_failure(m) => MSG_CLI_UNAVAILABLE,
         TranslateError::Llm(_) => MSG_TRANSLATE_FAILED,
         TranslateError::Integrity => DICTIONARY_INTEGRITY_MESSAGE,
     }
@@ -178,6 +188,9 @@ pub fn ctrl_ctrl_flow(d: &FlowDeps, ti: &dyn TextInteraction, view: &dyn Explain
     match result {
         Ok(r) => view.show_result(r, s.ctrl_ctrl_display_mode),
         Err(TranslateError::Integrity) => view.show_error(DICTIONARY_INTEGRITY_MESSAGE),
+        Err(TranslateError::Llm(m)) if is_cli_start_failure(&m) => {
+            view.show_error(MSG_CLI_UNAVAILABLE)
+        }
         Err(_) => view.show_error(MSG_EXPLAIN_FAILED),
     }
 }
@@ -211,10 +224,26 @@ mod tests {
             .collect()
     }
 
+    const SPAWN_ERR: &str =
+        "Claude CLI call failed: failed to start Claude CLI: Access is denied. (os error 5)";
+
+    #[test]
+    fn cli_start_failure_is_recognised_by_stable_substring() {
+        assert!(is_cli_start_failure(SPAWN_ERR));
+        assert!(is_cli_start_failure("failed to start Claude CLI: x"));
+        assert!(!is_cli_start_failure(
+            "Claude CLI call failed: Claude CLI timed out"
+        ));
+        assert!(!is_cli_start_failure("boom"));
+        assert!(!is_cli_start_failure(""));
+    }
+
     #[derive(Clone, Copy)]
     enum LlmMode {
         Ok,
         Fail,
+        /// Fails like a CLI that could not be started (blocked cmd.exe, missing file).
+        SpawnFail,
         /// Returns a language set that differs from the request.
         BadLangs,
         /// Returns text without dictionary placeholders.
@@ -227,6 +256,7 @@ mod tests {
         fn translate(&self, req: &TranslationRequest) -> Result<TranslationResult, LlmError> {
             match self.0 {
                 LlmMode::Fail => Err(LlmError("boom".into())),
+                LlmMode::SpawnFail => Err(LlmError(SPAWN_ERR.into())),
                 LlmMode::BadLangs => Ok(TranslationResult {
                     translations: vec![(Lang::Vi, "x".into())],
                 }),
@@ -245,6 +275,7 @@ mod tests {
         fn explain(&self, req: &ExplanationRequest) -> Result<ExplanationResult, LlmError> {
             let translations = match self.0 {
                 LlmMode::Fail => return Err(LlmError("boom".into())),
+                LlmMode::SpawnFail => return Err(LlmError(SPAWN_ERR.into())),
                 LlmMode::DropsPlaceholders => req
                     .destinations
                     .iter()
@@ -523,6 +554,13 @@ mod tests {
             ),
             (
                 Alt {
+                    mode: LlmMode::SpawnFail,
+                    ..Alt::new(Some("안녕"))
+                },
+                MSG_CLI_UNAVAILABLE,
+            ),
+            (
+                Alt {
                     mode: LlmMode::BadLangs,
                     ..Alt::new(Some("안녕"))
                 },
@@ -581,6 +619,8 @@ mod tests {
         let s = settings(&[Lang::En], false);
         let log = run_ctrl(&s, LlmMode::Fail, Some("안녕"), &[]);
         assert_eq!(log.last(), Some(&format!("error:{MSG_EXPLAIN_FAILED}")));
+        let log = run_ctrl(&s, LlmMode::SpawnFail, Some("안녕"), &[]);
+        assert_eq!(log.last(), Some(&format!("error:{MSG_CLI_UNAVAILABLE}")));
         let log = run_ctrl(&s, LlmMode::Ok, Some("1234"), &[]);
         assert_eq!(log.last(), Some(&format!("error:{MSG_EXPLAIN_FAILED}")));
         let log = run_ctrl(

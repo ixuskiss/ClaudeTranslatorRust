@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use ct_app::dispatch::{AppState, Dispatcher, GestureAction, Snapshot};
 use ct_app::flows::{
-    Badge, ExplainView, FlowDeps, MSG_EXPLAIN_FAILED, MSG_TRANSLATE_FAILED, Notifier, alt_alt_flow,
-    ctrl_ctrl_flow,
+    Badge, ExplainView, FlowDeps, MSG_CLI_UNAVAILABLE, MSG_EXPLAIN_FAILED, MSG_TRANSLATE_FAILED,
+    Notifier, alt_alt_flow, ctrl_ctrl_flow,
 };
 use ct_app::logging;
 use ct_app::ui::tray::{Tray, TrayCommand};
@@ -28,8 +28,8 @@ use ct_core::{
     toggle_target, user_data_dir,
 };
 use ct_llm::{
-    BuiltProvider, ClaudeCliClient, ModelCatalog, ProviderOverrides, RealSpawner,
-    build_llm_provider, home_dir, refresh_catalog_and_warm_up,
+    BuiltProvider, CatalogSource, ClaudeCliClient, ModelCatalog, ProviderOverrides, RealSpawner,
+    RefreshOutcome, build_llm_provider, home_dir, refresh_catalog_and_warm_up,
 };
 use ct_win::chrome::{
     ChromeAdapter, READ_ONLY_STRATEGIES, REPLACE_STRATEGIES, RetryingInteraction, TextInteraction,
@@ -157,8 +157,11 @@ fn build_provider(
     )
 }
 
-/// Boots the CLI and refreshes the model list on a background thread (failures are
-/// non-fatal and only logged by the callee).
+/// The CLI-unavailable notice is shown at most once per run, however many warm-ups fail.
+static CLI_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Boots the CLI and refreshes the model list on a background thread. Failures are
+/// non-fatal; a CLI that cannot be started is reported once with a non-modal box.
 fn warm_up_in_background(built: &BuiltProvider, catalog: Arc<ModelCatalog>) {
     let built = BuiltProvider {
         provider: Arc::clone(&built.provider),
@@ -166,10 +169,22 @@ fn warm_up_in_background(built: &BuiltProvider, catalog: Arc<ModelCatalog>) {
     };
     let spawned = std::thread::Builder::new()
         .name("cli-warm-up".into())
-        .spawn(move || refresh_catalog_and_warm_up(&built, &catalog));
+        .spawn(move || {
+            if refresh_catalog_and_warm_up(&built, &catalog) == RefreshOutcome::SpawnFailed
+                && !CLI_NOTICE_SHOWN.swap(true, Ordering::AcqRel)
+            {
+                message_box(APP_TITLE, MSG_CLI_UNAVAILABLE);
+            }
+        });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "could not start the CLI warm-up thread");
     }
+}
+
+/// Settings shows the hardcoded fallback list only when no live or cached list exists, so
+/// opening it is a good moment for one more refresh attempt.
+fn should_retry_catalog(source: CatalogSource) -> bool {
+    source == CatalogSource::Fallback
 }
 
 /// Closes a replaced CLI client off the UI thread (it waits for an in-flight turn).
@@ -248,6 +263,19 @@ impl App {
                 });
             }
             TrayCommand::OpenSettings => {
+                if should_retry_catalog(self.catalog.source()) {
+                    let current = BuiltProvider {
+                        provider: Arc::clone(
+                            &self
+                                .state
+                                .llm
+                                .read()
+                                .unwrap_or_else(PoisonError::into_inner),
+                        ),
+                        client: self.client.borrow().clone(),
+                    };
+                    warm_up_in_background(&current, Arc::clone(&self.catalog));
+                }
                 let app = Rc::clone(self);
                 SettingsWindow::open(
                     Arc::clone(&self.settings_store),
@@ -510,6 +538,13 @@ mod tests {
     use ct_win::chrome::{CapturedText, ReplaceError};
 
     type Log = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn catalog_is_retried_only_when_settings_would_show_the_fallback() {
+        assert!(should_retry_catalog(CatalogSource::Fallback));
+        assert!(!should_retry_catalog(CatalogSource::Cache));
+        assert!(!should_retry_catalog(CatalogSource::Live));
+    }
 
     fn push(log: &Log, s: impl Into<String>) {
         log.lock().unwrap().push(s.into());
