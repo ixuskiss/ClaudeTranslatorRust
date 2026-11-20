@@ -10,6 +10,7 @@ mod generated {
 
 pub mod badge;
 pub mod explain;
+pub mod tray;
 pub mod win32;
 
 pub(crate) use generated::{BadgeWin, ExplainCard, ExplainLine, ExplainWin};
