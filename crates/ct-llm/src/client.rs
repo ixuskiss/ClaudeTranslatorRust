@@ -47,21 +47,21 @@ pub enum CliError {
 /// CLAUDE.md/skills/plugins/hooks/MCP (pure overhead for one isolated prompt per turn)
 /// without affecting auth.
 pub fn build_command(config: &ClaudeCliConfig) -> Vec<String> {
-    let mut cmd: Vec<String> = [
-        config.cli_path.as_str(),
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--tools",
-        "",
-        "--safe-mode",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    let mut cmd: Vec<String> = std::iter::once(config.cli_path.as_str())
+        .chain(config.cli_prefix_args.iter().map(String::as_str))
+        .chain([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--tools",
+            "",
+            "--safe-mode",
+        ])
+        .map(String::from)
+        .collect();
     if let Some(model) = config.model.as_deref().filter(|m| !m.is_empty()) {
         cmd.extend(["--model".to_string(), model.to_string()]);
     }
@@ -797,6 +797,17 @@ mod tests {
                 "low"
             ]
         );
+    }
+
+    #[test]
+    fn build_command_puts_prefix_args_right_after_program() {
+        let c = ClaudeCliConfig {
+            cli_path: r"C:\node\node.exe".into(),
+            cli_prefix_args: vec![r"C:\npm\cli.js".into()],
+            ..ClaudeCliConfig::default()
+        };
+        let cmd = build_command(&c);
+        assert_eq!(cmd[..3], [r"C:\node\node.exe", r"C:\npm\cli.js", "-p"]);
     }
 
     #[test]

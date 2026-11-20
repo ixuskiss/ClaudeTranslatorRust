@@ -14,6 +14,8 @@ pub enum LlmProviderKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeCliConfig {
     pub cli_path: String,
+    /// 실행 파일 바로 뒤, CLI 플래그 앞에 넣는 인자 (예: 구버전 npm 설치의 `node cli.js`).
+    pub cli_prefix_args: Vec<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub timeout: Duration,
@@ -25,6 +27,7 @@ impl Default for ClaudeCliConfig {
     fn default() -> Self {
         Self {
             cli_path: "claude".to_string(),
+            cli_prefix_args: Vec::new(),
             model: None,
             effort: None,
             timeout: Duration::from_secs(60),
@@ -141,6 +144,7 @@ pub fn load_app_config(env: &HashMap<String, String>) -> AppConfig {
         .unwrap_or(d.clear_every_n_turns);
     let claude_cli = ClaudeCliConfig {
         cli_path: raw(env, "CLAUDE_CLI_PATH").map_or(d.cli_path, str::to_string),
+        cli_prefix_args: d.cli_prefix_args,
         model: raw(env, "CLAUDE_CLI_MODEL").map(str::to_string),
         effort: raw(env, "CLAUDE_CLI_EFFORT").map(str::to_string),
         timeout: positive_secs(env, "CLAUDE_CLI_TIMEOUT_SECONDS", d.timeout),

@@ -13,10 +13,10 @@ pub mod spawner;
 pub use catalog::{CatalogSource, ListenerId, ModelCatalog, fallback_models};
 pub use client::{ClaudeCliClient, CliError, build_command};
 pub use factory::{
-    BuiltProvider, ProviderOverrides, build_llm_provider, refresh_catalog_and_warm_up,
-    resolve_cli_config,
+    BuiltProvider, ProviderOverrides, RefreshOutcome, build_llm_provider,
+    refresh_catalog_and_warm_up, resolve_cli_config,
 };
-pub use locator::{home_dir, resolve_claude_cli_path, which_on_path};
+pub use locator::{CliLaunch, home_dir, resolve_claude_cli, which_on_path};
 pub use mock::MockProvider;
 pub use models::{LIST_MODELS_REQUEST_ID, ModelInfo, parse_model_info};
 pub use provider::{ClaudeCliProvider, CliTransport};

@@ -7,8 +7,8 @@ use std::time::Duration;
 use ct_core::{AppConfig, ClaudeCliConfig, LlmProvider, LlmProviderKind};
 
 use crate::catalog::ModelCatalog;
-use crate::client::ClaudeCliClient;
-use crate::locator::{home_dir, resolve_claude_cli_path, which_on_path};
+use crate::client::{ClaudeCliClient, CliError};
+use crate::locator::{CliLaunch, home_dir, resolve_claude_cli, which_on_path};
 use crate::mock::MockProvider;
 use crate::models::ModelInfo;
 use crate::provider::ClaudeCliProvider;
@@ -35,13 +35,13 @@ fn non_empty(over: &str, base: &Option<String>) -> Option<String> {
 }
 
 /// Pure part of the factory: applies overrides (non-empty wins), uses the already
-/// resolved CLI path, and drops effort when the chosen model is known to the catalog
+/// resolved CLI launch spec, and drops effort when the chosen model is known to the catalog
 /// and supports no effort levels (e.g. haiku).
 pub fn resolve_cli_config(
     cfg: &ClaudeCliConfig,
     overrides: &ProviderOverrides,
     models: &[ModelInfo],
-    resolved_path: &str,
+    launch: &CliLaunch,
 ) -> ClaudeCliConfig {
     let model = non_empty(&overrides.model, &cfg.model);
     let mut effort = non_empty(&overrides.effort, &cfg.effort);
@@ -53,7 +53,8 @@ pub fn resolve_cli_config(
         effort = None;
     }
     ClaudeCliConfig {
-        cli_path: resolved_path.to_string(),
+        cli_path: launch.program.to_string_lossy().into_owned(),
+        cli_prefix_args: launch.prefix_args.clone(),
         model,
         effort,
         ..cfg.clone()
@@ -78,8 +79,14 @@ pub fn build_llm_provider(
     } else {
         overrides.cli_path.as_str()
     };
-    let path = resolve_claude_cli_path(configured, &which_on_path, &home_dir());
-    let config = resolve_cli_config(&cfg.claude_cli, overrides, models, &path);
+    let launch = resolve_claude_cli(configured, &which_on_path, &home_dir());
+    // Path only: never log prompt/text content.
+    tracing::info!(
+        program = %launch.program.display(),
+        prefix_args = launch.prefix_args.len(),
+        "Claude CLI resolved"
+    );
+    let config = resolve_cli_config(&cfg.claude_cli, overrides, models, &launch);
     let model = config.model.clone().unwrap_or_default();
     let client = Arc::new(ClaudeCliClient::new(
         config,
@@ -95,10 +102,38 @@ pub fn build_llm_provider(
 /// Background-startup step: boots the CLI via `list_models` (which starts the process
 /// itself; a separate warm_up would let a real turn slip in before `initialize`) and
 /// refreshes the catalog. No-op for the mock provider.
-pub fn refresh_catalog_and_warm_up(built: &BuiltProvider, catalog: &ModelCatalog) {
-    if let Some(client) = &built.client {
-        catalog.refresh(|| client.list_models(Duration::from_secs(10)));
+pub fn refresh_catalog_and_warm_up(
+    built: &BuiltProvider,
+    catalog: &ModelCatalog,
+) -> RefreshOutcome {
+    let Some(client) = &built.client else {
+        return RefreshOutcome::Skipped;
+    };
+    let mut spawn_failed = false;
+    let refreshed = catalog.refresh(|| {
+        let result = client.list_models(Duration::from_secs(10));
+        spawn_failed = matches!(result, Err(CliError::Spawn(_)));
+        result
+    });
+    if refreshed {
+        RefreshOutcome::Refreshed
+    } else if spawn_failed {
+        RefreshOutcome::SpawnFailed
+    } else {
+        RefreshOutcome::Failed
     }
+}
+
+/// Result of [`refresh_catalog_and_warm_up`]; catalog semantics are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Mock provider: nothing to do.
+    Skipped,
+    Refreshed,
+    /// Failed for a reason other than the process not starting (or returned no models).
+    Failed,
+    /// The CLI process could not be started (`CliError::Spawn`).
+    SpawnFailed,
 }
 
 #[cfg(test)]
@@ -109,7 +144,7 @@ mod tests {
     use crate::spawner::SpawnedCli;
     use ct_core::LlmProviderKind;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     struct NoSpawn;
     impl CliSpawner for NoSpawn {
@@ -138,7 +173,15 @@ mod tests {
         }
     }
     fn resolve(c: &ClaudeCliConfig, o: &ProviderOverrides) -> ClaudeCliConfig {
-        resolve_cli_config(c, o, &fallback_models(), "claude")
+        resolve_cli_config(
+            c,
+            o,
+            &fallback_models(),
+            &CliLaunch {
+                program: PathBuf::from("claude"),
+                prefix_args: Vec::new(),
+            },
+        )
     }
     fn arg_after(cmd: &[String], flag: &str) -> Option<String> {
         cmd.iter()
@@ -174,14 +217,53 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reports_spawn_failure_and_keeps_catalog() {
+        let cfg = app(LlmProviderKind::ClaudeCli);
+        let built = build_llm_provider(
+            &cfg,
+            Path::new("."),
+            &ov(r"C:\x\claude.exe", "", ""),
+            &[],
+            Arc::new(NoSpawn),
+        );
+        let catalog = ModelCatalog::new(None);
+        let before = catalog.get();
+        assert_eq!(
+            refresh_catalog_and_warm_up(&built, &catalog),
+            RefreshOutcome::SpawnFailed
+        );
+        assert_eq!(catalog.get(), before);
+        assert_eq!(catalog.source(), crate::catalog::CatalogSource::Fallback);
+    }
+
+    #[test]
+    fn refresh_is_skipped_for_mock_provider() {
+        let built = build_llm_provider(
+            &app(LlmProviderKind::Mock),
+            Path::new("."),
+            &ov("", "", ""),
+            &[],
+            Arc::new(NoSpawn),
+        );
+        assert_eq!(
+            refresh_catalog_and_warm_up(&built, &ModelCatalog::new(None)),
+            RefreshOutcome::Skipped
+        );
+    }
+
+    #[test]
     fn cli_path_override_takes_precedence() {
         let c = resolve_cli_config(
             &ClaudeCliConfig::default(),
             &ov(r"C:\override\claude.exe", "", ""),
             &[],
-            r"C:\override\claude.exe",
+            &CliLaunch {
+                program: PathBuf::from(r"C:\override\claude.exe"),
+                prefix_args: vec!["cli.js".to_string()],
+            },
         );
         assert_eq!(c.cli_path, r"C:\override\claude.exe");
+        assert_eq!(c.cli_prefix_args, ["cli.js"]);
     }
 
     #[test]
