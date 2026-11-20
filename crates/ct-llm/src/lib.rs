@@ -11,7 +11,7 @@ pub mod provider;
 pub mod spawner;
 
 pub use catalog::{CatalogSource, ListenerId, ModelCatalog, fallback_models};
-pub use client::{ClaudeCliClient, CliError, build_command};
+pub use client::{CLI_START_FAILURE_MARKER, ClaudeCliClient, CliError, build_command};
 pub use factory::{
     BuiltProvider, ProviderOverrides, RefreshOutcome, build_llm_provider,
     refresh_catalog_and_warm_up, resolve_cli_config,

@@ -68,7 +68,8 @@ fn unwrap_shim(path: &Path, which: &dyn Fn(&str) -> Option<PathBuf>) -> CliLaunc
     CliLaunch::direct(path)
 }
 
-/// Resolution order: explicit `configured` path (anything other than empty / bare
+/// Resolution order: explicit `configured` path (quotes/whitespace stripped; anything other
+/// than empty / bare
 /// `claude`), then PATH (`claude.exe` before `claude.cmd`), then npm's default global bin
 /// directory, then the bare name so the eventual error is a plain "not found" from the OS.
 /// Shims are unwrapped at every step.
@@ -77,8 +78,18 @@ pub fn resolve_claude_cli(
     which: &dyn Fn(&str) -> Option<PathBuf>,
     home: &Path,
 ) -> CliLaunch {
+    // Explorer's "Copy as path" wraps the value in double quotes.
+    let configured = configured.trim().trim_matches('"').trim();
     if !configured.is_empty() && configured != "claude" {
-        return unwrap_shim(Path::new(configured), which);
+        let path = Path::new(configured);
+        // No directory part (e.g. `claude.cmd`): a PATH lookup, never relative to the cwd.
+        let has_dir = path.parent().is_some_and(|p| !p.as_os_str().is_empty());
+        let located = if has_dir {
+            path.to_path_buf()
+        } else {
+            which(configured).unwrap_or_else(|| path.to_path_buf())
+        };
+        return unwrap_shim(&located, which);
     }
     if let Some(found) = which("claude.exe")
         .or_else(|| which("claude.cmd"))
@@ -182,6 +193,62 @@ mod tests {
 
     fn shim_on_path(cmd: PathBuf) -> impl Fn(&str) -> Option<PathBuf> {
         move |n: &str| (n == "claude.cmd").then(|| cmd.clone())
+    }
+
+    #[test]
+    fn bare_file_name_goes_through_path_lookup_not_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = new_layout(dir.path());
+        let which = shim_on_path(dir.path().join("claude.cmd"));
+        let r = resolve_claude_cli("claude.cmd", &which, Path::new("."));
+        assert_eq!(r, launch(&exe, &[]));
+        let which = |n: &str| (n == "claude.exe").then(|| PathBuf::from(r"C:\native\claude.exe"));
+        let r = resolve_claude_cli("claude.exe", &which, Path::new("."));
+        assert_eq!(r, launch(Path::new(r"C:\native\claude.exe"), &[]));
+        let r = resolve_claude_cli(
+            "Claude",
+            &|n: &str| (n == "Claude").then(|| PathBuf::from(r"C:\x\claude.exe")),
+            Path::new("."),
+        );
+        assert_eq!(r, launch(Path::new(r"C:\x\claude.exe"), &[]));
+    }
+
+    #[test]
+    fn bare_file_name_not_on_path_is_kept_as_given() {
+        let r = resolve_claude_cli("claude.cmd", &none, Path::new("."));
+        assert_eq!(r, launch(Path::new("claude.cmd"), &[]));
+    }
+
+    #[test]
+    fn quoted_and_padded_configured_path_is_cleaned_and_unwrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = new_layout(dir.path());
+        let quoted = format!("  \"{}\"  ", dir.path().join("claude.cmd").display());
+        let r = resolve_claude_cli(&quoted, &none, Path::new("."));
+        assert_eq!(r, launch(&exe, &[]));
+        // A value that is only quotes counts as empty.
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_claude_cli("\"\"", &none, home.path()),
+            launch(Path::new("claude"), &[])
+        );
+    }
+
+    #[test]
+    fn uppercase_cmd_extension_is_unwrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = pkg(dir.path()).join("bin").join("claude.exe");
+        touch(&exe);
+        let upper = dir.path().join("claude.CMD");
+        touch(&upper);
+        let r = resolve_claude_cli(&upper.to_string_lossy(), &none, Path::new("."));
+        assert_eq!(r, launch(&exe, &[]));
+        let u2 = upper.clone();
+        let which = move |n: &str| (n == "claude.cmd").then(|| u2.clone());
+        assert_eq!(
+            resolve_claude_cli("", &which, Path::new(".")),
+            launch(&exe, &[])
+        );
     }
 
     #[test]

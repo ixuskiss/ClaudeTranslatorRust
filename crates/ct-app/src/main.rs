@@ -160,9 +160,31 @@ fn build_provider(
 /// The CLI-unavailable notice is shown at most once per run, however many warm-ups fail.
 static CLI_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
 
+/// Held while a Settings-triggered catalog retry runs, so repeated Settings opens start at
+/// most one at a time. Releases on drop (also if the thread panics).
+struct InFlight(&'static AtomicBool);
+
+impl InFlight {
+    fn try_begin(flag: &'static AtomicBool) -> Option<Self> {
+        (!flag.swap(true, Ordering::AcqRel)).then_some(Self(flag))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+static CATALOG_RETRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// Boots the CLI and refreshes the model list on a background thread. Failures are
 /// non-fatal; a CLI that cannot be started is reported once with a non-modal box.
-fn warm_up_in_background(built: &BuiltProvider, catalog: Arc<ModelCatalog>) {
+fn warm_up_in_background(
+    built: &BuiltProvider,
+    catalog: Arc<ModelCatalog>,
+    in_flight: Option<InFlight>,
+) {
     let built = BuiltProvider {
         provider: Arc::clone(&built.provider),
         client: built.client.clone(),
@@ -170,6 +192,7 @@ fn warm_up_in_background(built: &BuiltProvider, catalog: Arc<ModelCatalog>) {
     let spawned = std::thread::Builder::new()
         .name("cli-warm-up".into())
         .spawn(move || {
+            let _in_flight = in_flight;
             if refresh_catalog_and_warm_up(&built, &catalog) == RefreshOutcome::SpawnFailed
                 && !CLI_NOTICE_SHOWN.swap(true, Ordering::AcqRel)
             {
@@ -263,7 +286,9 @@ impl App {
                 });
             }
             TrayCommand::OpenSettings => {
-                if should_retry_catalog(self.catalog.source()) {
+                if should_retry_catalog(self.catalog.source())
+                    && let Some(guard) = InFlight::try_begin(&CATALOG_RETRY_IN_FLIGHT)
+                {
                     let current = BuiltProvider {
                         provider: Arc::clone(
                             &self
@@ -274,7 +299,7 @@ impl App {
                         ),
                         client: self.client.borrow().clone(),
                     };
-                    warm_up_in_background(&current, Arc::clone(&self.catalog));
+                    warm_up_in_background(&current, Arc::clone(&self.catalog), Some(guard));
                 }
                 let app = Rc::clone(self);
                 SettingsWindow::open(
@@ -328,7 +353,7 @@ impl App {
     fn on_settings_saved(&self, settings: UserSettings) {
         self.set_settings(&settings);
         let built = build_provider(&self.config, &self.data_dir, &settings, &self.catalog);
-        warm_up_in_background(&built, Arc::clone(&self.catalog));
+        warm_up_in_background(&built, Arc::clone(&self.catalog), None);
         *self
             .state
             .llm
@@ -408,7 +433,7 @@ fn main() {
 
     let catalog = Arc::new(ModelCatalog::new(Some(data_dir.join(MODELS_CACHE_FILE))));
     let built = build_provider(&config, &data_dir, &settings, &catalog);
-    warm_up_in_background(&built, Arc::clone(&catalog));
+    warm_up_in_background(&built, Arc::clone(&catalog), None);
 
     let state = Arc::new(AppState {
         settings: RwLock::new(settings.clone()),
@@ -538,6 +563,16 @@ mod tests {
     use ct_win::chrome::{CapturedText, ReplaceError};
 
     type Log = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn in_flight_guard_allows_one_holder_and_releases_on_drop() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let first = InFlight::try_begin(&FLAG);
+        assert!(first.is_some());
+        assert!(InFlight::try_begin(&FLAG).is_none());
+        drop(first);
+        assert!(InFlight::try_begin(&FLAG).is_some());
+    }
 
     #[test]
     fn catalog_is_retried_only_when_settings_would_show_the_fallback() {

@@ -9,6 +9,7 @@ use ct_core::{
     DICTIONARY_INTEGRITY_MESSAGE, DictionaryEntry, DisplayMode, ExplanationResult,
     LanguageDetector, LlmProvider, TranslateError, UserSettings, explain_text, translate_text,
 };
+use ct_llm::CLI_START_FAILURE_MARKER;
 use ct_win::chrome::{ReplaceError, TextInteraction};
 
 pub const MSG_DIRECTION_UNKNOWN: &str = "번역 방향을 판단할 수 없어 원문을 변경하지 않았습니다.";
@@ -77,7 +78,7 @@ fn replace_error_kind(e: &ReplaceError) -> &'static str {
 /// (`CliError::Spawn`, wrapped by the provider as "Claude CLI call failed: failed to start
 /// Claude CLI: ...").
 pub fn is_cli_start_failure(message: &str) -> bool {
-    message.contains("failed to start Claude CLI")
+    message.contains(CLI_START_FAILURE_MARKER)
 }
 
 fn translate_error_message(e: &TranslateError) -> &'static str {

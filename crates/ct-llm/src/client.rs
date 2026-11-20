@@ -29,6 +29,10 @@ use crate::models::{LIST_MODELS_REQUEST_ID, ModelInfo, parse_model_info};
 use crate::provider::CliTransport;
 use crate::spawner::{ChildHandle, CliSpawner, SpawnedCli};
 
+/// Text that `CliError::Spawn` displays before its detail. `#[error]` needs a literal, so
+/// a ct-llm test keeps this in sync; the app matches on it to recognise start failures.
+pub const CLI_START_FAILURE_MARKER: &str = "failed to start Claude CLI";
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum CliError {
     #[error("Claude CLI timed out")]

@@ -248,6 +248,16 @@ mod tests {
     }
 
     #[test]
+    fn spawn_failure_message_contains_the_shared_marker() {
+        let p = provider(Err(CliError::Spawn("denied".into())));
+        let m = msg(p.translate(&treq(&[Lang::En])));
+        assert!(m.contains(crate::client::CLI_START_FAILURE_MARKER), "{m}");
+        assert!(
+            !format!("{}", CliError::Timeout).contains(crate::client::CLI_START_FAILURE_MARKER)
+        );
+    }
+
+    #[test]
     fn transport_failure_is_wrapped() {
         let p = provider(Err(CliError::Timeout));
         assert_eq!(

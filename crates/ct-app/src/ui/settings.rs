@@ -11,7 +11,8 @@ use ct_core::{
     normalize_targets, with_base,
 };
 use ct_llm::{
-    CatalogSource, ListenerId, ModelCatalog, ModelInfo, home_dir, resolve_claude_cli, which_on_path,
+    CatalogSource, CliLaunch, ListenerId, ModelCatalog, ModelInfo, home_dir, resolve_claude_cli,
+    which_on_path,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
@@ -80,6 +81,23 @@ pub fn step_interval(value: f64, up: bool) -> f64 {
 /// Spin box text (Qt double spin box default: 2 decimals).
 pub fn format_interval(value: f64) -> String {
     format!("{value:.2}")
+}
+
+/// Detected launch as one copyable command line: program, then any prefix args
+/// (e.g. `node.exe C:\npm\...\cli.js`), each quoted when it contains a space.
+pub fn describe_launch(launch: &CliLaunch) -> String {
+    let quote = |s: &str| {
+        if s.contains(' ') {
+            format!("\"{s}\"")
+        } else {
+            s.to_string()
+        }
+    };
+    std::iter::once(launch.program.to_string_lossy().into_owned())
+        .chain(launch.prefix_args.iter().cloned())
+        .map(|p| quote(&p))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Placeholder of the Claude CLI path field.
@@ -568,10 +586,11 @@ impl SettingsWindow {
         let models = catalog.get();
         let form = SettingsForm::new(settings, &models);
         let s = &form.settings;
-        let detected = resolve_claude_cli(&s.claude_cli_path, &which_on_path, &home_dir())
-            .program
-            .to_string_lossy()
-            .into_owned();
+        let detected = describe_launch(&resolve_claude_cli(
+            &s.claude_cli_path,
+            &which_on_path,
+            &home_dir(),
+        ));
 
         win.set_base_items(strings(BASE_ITEMS.iter().map(|l| l.code().to_string())));
         win.set_base_index(
@@ -1092,5 +1111,22 @@ mod tests {
     #[test]
     fn cli_placeholder_names_the_detected_path() {
         assert_eq!(cli_placeholder("claude"), "자동 감지: claude");
+    }
+
+    #[test]
+    fn describe_launch_shows_program_and_prefix_args() {
+        let l = CliLaunch {
+            program: r"C:\nodejs\node.exe".into(),
+            prefix_args: vec![r"C:\Users\a b\npm\cli.js".into()],
+        };
+        assert_eq!(
+            describe_launch(&l),
+            r#"C:\nodejs\node.exe "C:\Users\a b\npm\cli.js""#
+        );
+        let l = CliLaunch {
+            program: "claude".into(),
+            prefix_args: vec![],
+        };
+        assert_eq!(describe_launch(&l), "claude");
     }
 }
