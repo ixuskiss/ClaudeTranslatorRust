@@ -15,6 +15,7 @@ cargo run -p ct-app --example spike
 | 날짜 | S1 | S2 | S3 | S4 | S5 | 메모 |
 |---|---|---|---|---|---|---|
 | 2026-11-20 (1차) | 통과 | 판정 불가 (`badge unavailable`) | 판정 불가 (`no HWND`, 창은 앞에 뜸) | 통과 | `name_len=6 control_type=50000` (Button) | HWND를 `show()` 직후에 요청한 스파이크 버그. Alt 단독 탭으로 Chrome 포커스가 툴바 버튼으로 이동(F15 처리 없음). 2차: HWND 재시도 + v5 F15 처리 추가 |
+| 2026-11-20 (2차, c0130c7) | — | 통과 (`badge created and styled while hidden`, `badge shown, SetWindowPos ok=true`, 메모장 입력 유지) | 미보고 | 통과 (`ALT_ALT`, `F15 down ok=true up ok=true`) | 통과 (`name_len=5 control_type=50004` Edit) | v5 F15 처리로 Chrome 포커스가 Gmail 본문에 유지됨 |
 
 ## S1. Slint 창 + 트레이가 한 이벤트 루프에서 동작
 
