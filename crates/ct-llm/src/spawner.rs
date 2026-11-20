@@ -39,6 +39,8 @@ pub trait ChildHandle: Send {
     fn terminate(&mut self);
     /// Length (not content) of the captured stderr tail.
     fn stderr_tail_len(&self) -> usize;
+    /// Exit code if the process has already exited (diagnostics only).
+    fn exit_code(&mut self) -> Option<i32>;
 }
 
 pub struct SpawnedCli {
@@ -212,6 +214,10 @@ impl ChildHandle for RealChild {
         if !self.is_running() || self.child.kill().is_ok() {
             let _ = self.child.wait();
         }
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        self.child.try_wait().ok().flatten().and_then(|s| s.code())
     }
 
     fn stderr_tail_len(&self) -> usize {

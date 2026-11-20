@@ -181,6 +181,17 @@ fn write_loop(mut stdin: Box<dyn Write + Send>, requests: Receiver<WriteRequest>
     }
 }
 
+/// Logs a diagnostic (exit code and stderr tail length only, never content) and
+/// returns `ProcessEnded`.
+fn process_ended(child: &mut dyn ChildHandle) -> CliError {
+    tracing::warn!(
+        exit_code = ?child.exit_code(),
+        stderr_tail_len = child.stderr_tail_len(),
+        "claude CLI process ended"
+    );
+    CliError::ProcessEnded
+}
+
 struct Proc {
     writer: Sender<WriteRequest>,
     child: Box<dyn ChildHandle>,
@@ -290,22 +301,18 @@ impl Inner {
         }
     }
 
-    fn next_event(&self, deadline: Instant) -> Result<Value, CliError> {
+    fn next_event(&mut self, deadline: Instant) -> Result<Value, CliError> {
         // Checked first so a CLI that keeps streaming non-result events (always one
         // queued) cannot keep a turn alive past its deadline.
         let now = Instant::now();
         if now >= deadline {
             return Err(CliError::Timeout);
         }
-        let proc = self.proc.as_ref().ok_or(CliError::ProcessEnded)?;
+        let proc = self.proc.as_mut().ok_or(CliError::ProcessEnded)?;
         match proc.events.recv_timeout(deadline - now) {
             Ok(Some(event)) => Ok(event),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {
-                tracing::warn!(
-                    stderr_tail_len = proc.child.stderr_tail_len(),
-                    "claude CLI process ended"
-                );
-                Err(CliError::ProcessEnded)
+                Err(process_ended(proc.child.as_mut()))
             }
             Err(RecvTimeoutError::Timeout) => Err(CliError::Timeout),
         }
@@ -314,19 +321,19 @@ impl Inner {
     /// Hands one line to the writer thread and waits for its acknowledgement until
     /// `deadline` (a CLI hung at boot stops reading stdin once the pipe buffer fills).
     fn send(&mut self, message: String, deadline: Instant) -> Result<(), CliError> {
-        let proc = self.proc.as_ref().ok_or(CliError::ProcessEnded)?;
+        let proc = self.proc.as_mut().ok_or(CliError::ProcessEnded)?;
         let mut line = message.into_bytes();
         line.push(b'\n');
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        proc.writer
-            .send((line, ack_tx))
-            .map_err(|_| CliError::ProcessEnded)?;
+        if proc.writer.send((line, ack_tx)).is_err() {
+            return Err(process_ended(proc.child.as_mut()));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match ack_rx.recv_timeout(remaining) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(CliError::Io(e)),
             Err(RecvTimeoutError::Timeout) => Err(CliError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(CliError::ProcessEnded),
+            Err(RecvTimeoutError::Disconnected) => Err(process_ended(proc.child.as_mut())),
         }
     }
 
@@ -566,6 +573,9 @@ mod tests {
         }
         fn stderr_tail_len(&self) -> usize {
             0
+        }
+        fn exit_code(&mut self) -> Option<i32> {
+            None
         }
     }
 
@@ -967,7 +977,7 @@ mod tests {
         let (tx, events) = crossbeam_channel::unbounded();
         tx.send(Some(init_event())).unwrap();
         let (writer, _writer_rx) = crossbeam_channel::unbounded();
-        let inner = Inner {
+        let mut inner = Inner {
             proc: Some(Proc {
                 writer,
                 child: Box::new(FakeChild {
