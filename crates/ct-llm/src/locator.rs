@@ -30,7 +30,7 @@ pub fn resolve_claude_cli_path(
 }
 
 /// Looks `name` up on PATH (trying PATHEXT extensions on Windows).
-pub(crate) fn which_on_path(name: &str) -> Option<PathBuf> {
+pub fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -57,7 +57,7 @@ pub(crate) fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn home_dir() -> PathBuf {
+pub fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)

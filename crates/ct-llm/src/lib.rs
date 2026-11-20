@@ -16,7 +16,7 @@ pub use factory::{
     BuiltProvider, ProviderOverrides, build_llm_provider, refresh_catalog_and_warm_up,
     resolve_cli_config,
 };
-pub use locator::resolve_claude_cli_path;
+pub use locator::{home_dir, resolve_claude_cli_path, which_on_path};
 pub use mock::MockProvider;
 pub use models::{LIST_MODELS_REQUEST_ID, ModelInfo, parse_model_info};
 pub use provider::{ClaudeCliProvider, CliTransport};

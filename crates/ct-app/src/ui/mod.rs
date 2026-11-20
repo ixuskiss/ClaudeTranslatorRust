@@ -1,4 +1,4 @@
-//! Slint windows (badge, explanation window) and their Win32 helpers.
+//! Slint windows (badge, explanation window, settings) and their Win32 helpers.
 //!
 //! `build.rs` compiles only `ui/app.slint`, which re-exports the components of the other
 //! `ui/*.slint` files, so a single `include_modules!()` brings them all in.
@@ -10,10 +10,14 @@ mod generated {
 
 pub mod badge;
 pub mod explain;
+pub mod settings;
 pub mod tray;
 pub mod win32;
 
-pub(crate) use generated::{BadgeWin, ExplainCard, ExplainLine, ExplainWin};
+pub(crate) use generated::{
+    BadgeWin, ExplainCard, ExplainLine, ExplainWin, SettingsWin, TargetRow,
+};
 
 pub use badge::BadgeWindow;
 pub use explain::ExplainWindow;
+pub use settings::SettingsWindow;

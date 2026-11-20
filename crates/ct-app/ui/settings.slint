@@ -1,0 +1,420 @@
+// Settings window (v5 §4.4, spec §5.2, palette §4.1). All state lives in Rust
+// (`ui/settings.rs`); this file only lays out the cards and forwards user actions.
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+
+export struct TargetRow {
+    // Checkbox text, e.g. `en (1)` for a checked language or `vi` for an unchecked one.
+    label: string,
+    checked: bool,
+    can-up: bool,
+    can-down: bool,
+}
+
+// White rounded card with a bold 14px title.
+component Card inherits Rectangle {
+    in property <string> title;
+    background: #FFFFFF;
+    border-radius: 14px;
+
+    VerticalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 16px;
+        padding-bottom: 16px;
+        spacing: 0px;
+
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 700;
+            color: #2B2B2B;
+        }
+
+        Rectangle {
+            height: 4px;
+        }
+
+        @children
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: #F0DEDC;
+}
+
+// Bold label with an optional gray description underneath.
+component RowLabel inherits VerticalLayout {
+    in property <string> title;
+    in property <string> description;
+    in property <bool> description-visible: root.description != "";
+    alignment: center;
+    spacing: 2px;
+
+    Text {
+        text: root.title;
+        font-weight: 700;
+        color: #2B2B2B;
+        wrap: word-wrap;
+    }
+
+    if root.description-visible: Text {
+        text: root.description;
+        color: #8A8A8A;
+        wrap: word-wrap;
+    }
+}
+
+// Label on the left, control (children) on the right; row margins (0, 8, 0, 8).
+component Row inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> description;
+    in property <bool> description-visible: root.description != "";
+    padding-top: 8px;
+    padding-bottom: 8px;
+    spacing: 12px;
+
+    RowLabel {
+        title: root.title;
+        description: root.description;
+        description-visible: root.description-visible;
+        horizontal-stretch: 1;
+    }
+
+    Rectangle {
+        width: 260px;
+
+        HorizontalLayout {
+            alignment: end;
+            @children
+        }
+    }
+}
+
+// Double spin box (0.1 .. 2.0, step 0.1): the value is formatted and stepped in Rust.
+component IntervalSpin inherits HorizontalLayout {
+    in property <string> text;
+    callback step(bool);
+    spacing: 4px;
+    alignment: end;
+
+    Button {
+        text: "−";
+        clicked => {
+            root.step(false);
+        }
+    }
+
+    Rectangle {
+        width: 64px;
+        border-width: 1px;
+        border-color: #F0DEDC;
+        border-radius: 6px;
+        background: #FFFFFF;
+
+        Text {
+            text: root.text;
+            color: #2B2B2B;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    Button {
+        text: "+";
+        clicked => {
+            root.step(true);
+        }
+    }
+}
+
+export component SettingsWin inherits Window {
+    // Card 일반
+    in property <[string]> base-items;
+    in-out property <int> base-index;
+    in property <[TargetRow]> targets;
+    in-out property <bool> include-original;
+    in property <string> include-original-label;
+    in property <string> include-original-description;
+    in-out property <bool> start-on-login;
+    in property <string> start-on-login-label;
+    in-out property <string> cli-path;
+    in property <string> cli-placeholder;
+    in property <[string]> model-items;
+    in-out property <int> model-index;
+    in property <bool> fallback-hint-visible;
+    in property <string> fallback-hint;
+    in property <[string]> effort-items;
+    in-out property <int> effort-index;
+    in property <bool> effort-enabled;
+    in property <string> effort-hint;
+    in property <[string]> tone-items;
+    in-out property <int> tone-index;
+    // Card 창 모드 번역
+    in property <string> ctrl-ctrl-interval;
+    in property <[string]> display-items;
+    in-out property <int> display-index;
+    // Card 번역 후 교체
+    in property <string> alt-alt-interval;
+    // Card 한글 교정
+    in property <[string]> correction-items;
+    in-out property <int> correction-index;
+    // Card 단축키 안내
+    in property <string> shortcut-guide;
+    // Save
+    in property <bool> can-save;
+    in property <string> no-target-message;
+
+    callback base-selected(int);
+    callback target-toggled(int);
+    callback target-moved(int, bool);
+    callback model-selected(int);
+    callback effort-selected(int);
+    callback ctrl-ctrl-step(bool);
+    callback alt-alt-step(bool);
+    callback save();
+
+    title: "ClaudeTranslator - Settings";
+    background: #FBEEEC;
+    min-width: 480px;
+    preferred-width: 600px;
+    preferred-height: 760px;
+
+    // Fixed light palette regardless of the OS theme (v5 §4.1).
+    init => {
+        Palette.color-scheme = ColorScheme.light;
+    }
+
+    VerticalLayout {
+        ScrollView {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Card {
+                    title: "일반";
+
+                    Row {
+                        title: "Base Language";
+                        ComboBox {
+                            model: root.base-items;
+                            current-index <=> root.base-index;
+                            selected => {
+                                root.base-selected(self.current-index);
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    HorizontalLayout {
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 12px;
+
+                        RowLabel {
+                            title: "Target Languages";
+                            horizontal-stretch: 1;
+                        }
+
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 260px;
+
+                            for row[i] in root.targets: HorizontalLayout {
+                                spacing: 4px;
+                                alignment: end;
+
+                                CheckBox {
+                                    text: row.label;
+                                    checked: row.checked;
+                                    horizontal-stretch: 1;
+                                    toggled => {
+                                        root.target-toggled(i);
+                                    }
+                                }
+
+                                Button {
+                                    text: "▲";
+                                    enabled: row.can-up;
+                                    clicked => {
+                                        root.target-moved(i, true);
+                                    }
+                                }
+
+                                Button {
+                                    text: "▼";
+                                    enabled: row.can-down;
+                                    clicked => {
+                                        root.target-moved(i, false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: root.include-original-label;
+                        description: root.include-original-description;
+                        CheckBox {
+                            checked <=> root.include-original;
+                        }
+                    }
+
+                    Divider { }
+
+                    HorizontalLayout {
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+
+                        CheckBox {
+                            text: root.start-on-login-label;
+                            checked <=> root.start-on-login;
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: "Claude CLI 경로";
+                        description: "비워두면 자동 감지합니다.";
+                        LineEdit {
+                            text <=> root.cli-path;
+                            placeholder-text: root.cli-placeholder;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: "Claude Model";
+                        description: root.fallback-hint;
+                        description-visible: root.fallback-hint-visible;
+                        ComboBox {
+                            model: root.model-items;
+                            current-index <=> root.model-index;
+                            selected => {
+                                root.model-selected(self.current-index);
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: "Claude Effort";
+                        description: root.effort-hint;
+                        description-visible: !root.effort-enabled;
+                        ComboBox {
+                            model: root.effort-items;
+                            enabled: root.effort-enabled;
+                            current-index <=> root.effort-index;
+                            selected => {
+                                root.effort-selected(self.current-index);
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: "번역 어투";
+                        ComboBox {
+                            model: root.tone-items;
+                            current-index <=> root.tone-index;
+                        }
+                    }
+                }
+
+                Card {
+                    title: "창 모드 번역 (Ctrl+Ctrl)";
+
+                    Row {
+                        title: "단축키 간격 (초)";
+                        IntervalSpin {
+                            text: root.ctrl-ctrl-interval;
+                            step(up) => {
+                                root.ctrl-ctrl-step(up);
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Row {
+                        title: "표시 방식";
+                        ComboBox {
+                            model: root.display-items;
+                            current-index <=> root.display-index;
+                        }
+                    }
+                }
+
+                Card {
+                    title: "번역 후 교체 (Alt+Alt)";
+
+                    Row {
+                        title: "단축키 간격 (초)";
+                        IntervalSpin {
+                            text: root.alt-alt-interval;
+                            step(up) => {
+                                root.alt-alt-step(up);
+                            }
+                        }
+                    }
+                }
+
+                Card {
+                    title: "한글 교정 (Ctrl+Alt+Alt / Alt+Ctrl+Ctrl)";
+
+                    Row {
+                        title: "교정 범위";
+                        ComboBox {
+                            model: root.correction-items;
+                            current-index <=> root.correction-index;
+                        }
+                    }
+                }
+
+                Card {
+                    title: "단축키 안내";
+
+                    Text {
+                        text: root.shortcut-guide;
+                        color: #8A8A8A;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 8px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            Text {
+                text: root.can-save ? "" : root.no-target-message;
+                color: #2B2B2B;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+            }
+
+            Button {
+                text: "Save";
+                enabled: root.can-save;
+                clicked => {
+                    root.save();
+                }
+            }
+        }
+    }
+}
