@@ -1,6 +1,8 @@
 //! Opt-in integration tests against the real Claude Code CLI.
 //!
 //! Skipped unless `RUN_CLAUDE_CLI_LIVE_TESTS=1`. Requires `claude` installed and signed in.
+//!
+//! Run live tests from PowerShell; spawning claude.cmd from Git Bash may fail with os error 5.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,8 +89,16 @@ fn live_translate_multi_keeps_tokens() {
     for (_, t) in &result.translations {
         assert!(t.contains("DA"), "missing DA in {t}");
     }
-    let en = &result.translations[0].1;
-    let ja = &result.translations[1].1;
+    let by_lang = |lang: Lang| {
+        result
+            .translations
+            .iter()
+            .find(|(l, _)| *l == lang)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or_else(|| panic!("missing {lang:?} translation"))
+    };
+    let en = by_lang(Lang::En);
+    let ja = by_lang(Lang::Ja);
     assert!(en.contains("logical model"), "en: {en}");
     assert!(ja.contains("論理モデル"), "ja: {ja}");
 }
