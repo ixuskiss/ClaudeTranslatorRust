@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+dotenvy.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
 
