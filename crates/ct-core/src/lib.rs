@@ -2,6 +2,7 @@
 
 pub mod compose;
 pub mod config;
+pub mod correction;
 pub mod detector;
 pub mod dictionary;
 pub mod explain;
@@ -26,6 +27,7 @@ pub use config::{
     AppConfig, ClaudeCliConfig, LlmProviderKind, SheetsConfig, load_app_config,
     load_app_config_from_environment,
 };
+pub use correction::{CorrectionOutcome, CorrectionStatus, correct_sentences, correct_text};
 pub use detector::{LanguageDetector, RuleBasedDetector};
 pub use dictionary::{
     Action, DictionaryEntry, DictionaryError, PersonalDictionaryStore, load_dictionary_file,
