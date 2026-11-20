@@ -77,32 +77,25 @@ impl Dispatcher {
         }
     }
 
-    fn snapshot(&self) -> Snapshot {
+    fn snapshot(state: &AppState) -> Snapshot {
         Snapshot {
-            settings: self
-                .state
+            settings: state
                 .settings
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
-            entries: self
-                .state
+            entries: state
                 .entries
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
-            llm: Arc::clone(
-                &self
-                    .state
-                    .llm
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner),
-            ),
+            llm: Arc::clone(&state.llm.read().unwrap_or_else(PoisonError::into_inner)),
         }
     }
 
     /// Called from the hook thread. Ignored while paused; dropped (not queued) while the same
-    /// family is running; otherwise runs the action on a new thread with a trigger-time snapshot.
+    /// family is running; otherwise runs the action on a new thread, which snapshots the state
+    /// before the action body runs.
     pub fn dispatch(&self, gesture: Gesture) {
         if self.state.paused.load(Ordering::Acquire) {
             return;
@@ -116,11 +109,13 @@ impl Dispatcher {
             return;
         }
         let release = GuardRelease(Arc::clone(guard));
-        let snapshot = self.snapshot();
+        let state = Arc::clone(&self.state);
         let action = Arc::clone(&self.action);
         let spawned = std::thread::Builder::new()
             .name("gesture-action".into())
             .spawn(move || {
+                // Snapshot first, on this thread: the hook thread must never wait on state locks.
+                let snapshot = Self::snapshot(&state);
                 let _release = release;
                 if catch_unwind(AssertUnwindSafe(|| action.run(gesture, snapshot))).is_err() {
                     tracing::error!(?gesture, "gesture action panicked");
@@ -335,6 +330,31 @@ mod tests {
         h.state.settings.write().unwrap().claude_model = "opus".to_string();
         assert_ne!(*h.state.settings.read().unwrap(), before);
         assert_eq!(snapshot.settings, before);
+        h.release.send(()).unwrap();
+    }
+
+    #[test]
+    fn dispatch_takes_snapshot_on_action_thread_not_hook_thread() {
+        let h = Arc::new(harness(vec![]));
+        // A writer holds the settings lock: dispatch (hook thread) must still return at once.
+        let mut settings = h.state.settings.write().unwrap();
+        let (done_tx, done_rx) = unbounded();
+        let h2 = Arc::clone(&h);
+        std::thread::spawn(move || {
+            h2.dispatcher.dispatch(Gesture::AltAlt);
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(WAIT).is_ok(),
+            "dispatch blocked on the state lock"
+        );
+        // The action has not run yet: it is waiting for the snapshot.
+        assert!(h.started.recv_timeout(SHORT).is_err());
+        settings.claude_model = "opus".to_string();
+        drop(settings);
+        // The snapshot is taken (first, on the action thread) before the action body runs.
+        let (_, snapshot) = h.started.recv_timeout(WAIT).unwrap();
+        assert_eq!(snapshot.settings.claude_model, "opus");
         h.release.send(()).unwrap();
     }
 }
