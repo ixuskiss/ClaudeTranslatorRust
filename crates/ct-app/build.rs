@@ -9,4 +9,13 @@ fn main() {
     if let Err(e) = slint_build::compile_with_config("ui/app.slint", config) {
         panic!("slint compile failed: {e}");
     }
+    // Exe icon (Explorer, taskbar, Alt+Tab): the same speech-bubble drawing as the tray icon.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=app.rc");
+        println!("cargo:rerun-if-changed=assets/app.ico");
+        if let Err(e) = embed_resource::compile("app.rc", embed_resource::NONE).manifest_optional()
+        {
+            panic!("embedding Windows resources failed: {e}");
+        }
+    }
 }

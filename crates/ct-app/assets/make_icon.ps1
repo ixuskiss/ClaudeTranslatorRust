@@ -105,4 +105,62 @@ for ($y = 0; $y -lt 32; $y++) {
     }
 }
 [System.IO.File]::WriteAllBytes((Join-Path $OutDir 'tray-32.rgba'), $bytes)
+
+# app.ico for the exe: the same drawing at 16..256 px. 256 is stored as PNG, smaller sizes
+# as 32-bit DIBs (BMP), which every Windows component can read.
+function DibBytes($bm) {
+    $s = $bm.Width
+    $ms = New-Object System.IO.MemoryStream
+    $bw = New-Object System.IO.BinaryWriter($ms)
+    # BITMAPINFOHEADER: height is doubled (XOR image + AND mask).
+    $bw.Write([UInt32]40); $bw.Write([Int32]$s); $bw.Write([Int32]($s * 2))
+    $bw.Write([UInt16]1); $bw.Write([UInt16]32); $bw.Write([UInt32]0)
+    $bw.Write([UInt32]0); $bw.Write([Int32]0); $bw.Write([Int32]0)
+    $bw.Write([UInt32]0); $bw.Write([UInt32]0)
+    for ($y = $s - 1; $y -ge 0; $y--) {          # bottom-up BGRA rows
+        for ($x = 0; $x -lt $s; $x++) {
+            $c = $bm.GetPixel($x, $y)
+            $bw.Write([byte]$c.B); $bw.Write([byte]$c.G); $bw.Write([byte]$c.R); $bw.Write([byte]$c.A)
+        }
+    }
+    $maskRow = [int]([Math]::Ceiling($s / 32.0) * 4)  # 1-bpp AND mask, all zero (alpha is used)
+    $bw.Write((New-Object byte[] ($maskRow * $s)))
+    $bw.Flush()
+    # Leading comma keeps the byte[] intact instead of unrolling it into the pipeline.
+    return ,([byte[]]$ms.ToArray())
+}
+$hi = Draw-Icon 512
+$sizes = @(16, 24, 32, 48, 64, 128, 256)
+$pngs = @()
+foreach ($s in $sizes) {
+    $bm = New-Object System.Drawing.Bitmap($s, $s, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $gg = [System.Drawing.Graphics]::FromImage($bm)
+    $gg.InterpolationMode = 'HighQualityBicubic'
+    $gg.PixelOffsetMode = 'HighQuality'
+    $gg.Clear([System.Drawing.Color]::Transparent)
+    $gg.DrawImage($hi, 0, 0, $s, $s)
+    $gg.Dispose()
+    if ($s -ge 256) {
+        $ms = New-Object System.IO.MemoryStream
+        $bm.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+        $pngs += ,($ms.ToArray())
+    } else {
+        $pngs += ,(DibBytes $bm)
+    }
+}
+$out = New-Object System.IO.MemoryStream
+$w = New-Object System.IO.BinaryWriter($out)
+$w.Write([UInt16]0); $w.Write([UInt16]1); $w.Write([UInt16]$sizes.Count)
+$offset = 6 + 16 * $sizes.Count
+for ($i = 0; $i -lt $sizes.Count; $i++) {
+    $s = $sizes[$i]
+    $dim = if ($s -ge 256) { 0 } else { $s }
+    $w.Write([byte]$dim); $w.Write([byte]$dim); $w.Write([byte]0); $w.Write([byte]0)
+    $w.Write([UInt16]1); $w.Write([UInt16]32)
+    $w.Write([UInt32]$pngs[$i].Length); $w.Write([UInt32]$offset)
+    $offset += $pngs[$i].Length
+}
+foreach ($p in $pngs) { $w.Write([byte[]]$p) }
+$w.Flush()
+[System.IO.File]::WriteAllBytes((Join-Path $OutDir 'app.ico'), $out.ToArray())
 "ok"
