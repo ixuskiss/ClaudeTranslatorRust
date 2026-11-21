@@ -31,6 +31,20 @@ pub const POLISH_BANNED_WORDS: &[&str] = &[
     "깊이 있는",
 ];
 
+/// Overconfident or filler expressions the polish prompt forbids introducing unless the
+/// original already uses them.
+pub const POLISH_OVERCONFIDENT_WORDS: &[&str] = &[
+    "반드시",
+    "확실히",
+    "분명히",
+    "틀림없이",
+    "의심의 여지 없이",
+    "단언컨대",
+    "100%",
+    "결론적으로",
+    "요약하자면",
+];
+
 const STRICT_FORMATTING_INSTRUCTION: &str = concat!(
     "Preserve the original text's line breaks and non-alphabetic formatting ",
     "(e.g. \"->\", bullet points, indentation) exactly -- translate only the ",
@@ -47,7 +61,12 @@ const SPELLING_INSTRUCTION: &str = concat!(
     "Fix only typos, spelling mistakes and Korean spacing (띄어쓰기) errors. ",
     "Do not change word choice, word order, tone, politeness level or meaning. "
 );
-const POLISH_MERGE_SPLIT_INSTRUCTION: &str = "You may merge or split sentences. ";
+const POLISH_MERGE_SPLIT_INSTRUCTION: &str = concat!(
+    "Actively restructure the sentences: merge short, choppy sentences that belong together ",
+    "into one, split long or run-on sentences into shorter ones, and reorder clauses when that ",
+    "reads more naturally. Do this whenever it makes the text easier to read, as long as the ",
+    "meaning stays the same. "
+);
 const POLISH_ONE_TO_ONE_INSTRUCTION: &str = concat!(
     "Return exactly one corrected sentence for each original sentence; ",
     "within that sentence you may rewrite it completely. "
@@ -107,9 +126,16 @@ fn polish_instruction() -> String {
             "the paragraph and line-break structure. Do not add emphasis, exaggerated modifiers ",
             "or emotional words that are not in the original; use plain, matter-of-fact wording ",
             "suitable for work email and chat. In particular, do not introduce these words unless ",
-            "the original already uses them: {}. "
+            "the original already uses them: {}. ",
+            "Write the way a person naturally writes a work message, not like an AI assistant: ",
+            "no emojis or emoticons, no exclamation marks that are not in the original, no flowery ",
+            "or exaggerated modifiers, no overconfident or absolute claims (keep any hedging or ",
+            "uncertainty in the original as it is), and no summary or conclusion lines that the ",
+            "original does not have. Do not introduce these expressions unless the original ",
+            "already uses them: {}. "
         ),
-        POLISH_BANNED_WORDS.join(", ")
+        POLISH_BANNED_WORDS.join(", "),
+        POLISH_OVERCONFIDENT_WORDS.join(", ")
     )
 }
 
@@ -294,8 +320,36 @@ mod tests {
         for w in POLISH_BANNED_WORDS {
             assert!(p.contains(w));
         }
-        assert!(p.contains("You may merge or split sentences."));
         assert!(p.contains("⟦N⟧"));
+    }
+
+    #[test]
+    fn polish_single_prompt_actively_merges_and_splits() {
+        let p = correction_prompt(&corr(CorrectionMode::Polish), "sonnet");
+        assert!(p.contains(POLISH_MERGE_SPLIT_INSTRUCTION));
+        assert!(p.contains("merge short, choppy sentences"));
+        assert!(p.contains("split long or run-on sentences"));
+    }
+
+    #[test]
+    fn polish_prompts_ask_for_human_style() {
+        let single = correction_prompt(&corr(CorrectionMode::Polish), "sonnet");
+        let sentences = sentence_correction_prompt(&corr(CorrectionMode::Polish));
+        for p in [single, sentences] {
+            assert!(p.contains("not like an AI assistant"));
+            assert!(p.contains("no emojis"));
+            assert!(p.contains("no overconfident or absolute claims"));
+            for w in POLISH_OVERCONFIDENT_WORDS {
+                assert!(p.contains(w), "{w}");
+            }
+        }
+    }
+
+    #[test]
+    fn spelling_prompt_has_no_human_style_block() {
+        let p = correction_prompt(&corr(CorrectionMode::Spelling), "sonnet");
+        assert!(!p.contains("not like an AI assistant"));
+        assert!(!p.contains(POLISH_OVERCONFIDENT_WORDS[0]));
     }
 
     #[test]
