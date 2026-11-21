@@ -2,7 +2,11 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
+use ct_core::Lang;
 use ct_core::llm::{
+    BatchCorrectionRequest, BatchCorrectionResult, BatchTranslationRequest, BatchTranslationResult,
     CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult,
     ExplanationSentence, LlmError, LlmProvider, TranslationRequest, TranslationResult,
     parse_json_response, parse_language_map,
@@ -11,7 +15,8 @@ use serde_json::Value;
 
 use crate::client::CliError;
 use crate::prompts::{
-    correction_prompt, explanation_prompt, sentence_correction_prompt, translation_prompt,
+    batch_correction_prompt, batch_translation_prompt, correction_prompt, explanation_prompt,
+    sentence_correction_prompt, translation_prompt,
 };
 
 /// Sends one prompt and returns the CLI's stream-json `result` event.
@@ -26,6 +31,26 @@ pub struct ClaudeCliProvider {
 
 fn err(msg: &str) -> LlmError {
     LlmError(msg.to_string())
+}
+
+fn batch_malformed() -> LlmError {
+    err("Claude CLI batch response has a malformed entry")
+}
+
+/// The `list_key` array of a batch reply, every element required to be a JSON object.
+fn batch_entries<'a>(parsed: &'a Value, list_key: &str) -> Result<&'a [Value], LlmError> {
+    let list = parsed
+        .get(list_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LlmError(format!(
+                "Claude CLI batch response missing '{list_key}' list"
+            ))
+        })?;
+    if list.iter().any(|e| !e.is_object()) {
+        return Err(batch_malformed());
+    }
+    Ok(list)
 }
 
 impl ClaudeCliProvider {
@@ -100,6 +125,96 @@ impl LlmProvider for ClaudeCliProvider {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
             .ok_or_else(|| err("Claude CLI correction response missing 'corrected'"))
+    }
+
+    fn translate_batch(
+        &self,
+        req: &BatchTranslationRequest,
+    ) -> Result<BatchTranslationResult, LlmError> {
+        let parsed = self.ask_json(&batch_translation_prompt(req, &self.model))?;
+        let entries = batch_entries(&parsed, "translations")?;
+        let mut by_id: HashMap<&str, Vec<(Lang, String)>> = HashMap::new();
+        for entry in entries {
+            let (id, texts) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .zip(entry.get("texts").and_then(Value::as_object))
+                .ok_or_else(batch_malformed)?;
+            let item = req
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .ok_or_else(|| err("Claude CLI batch response has an unknown id"))?;
+            if by_id.contains_key(id) {
+                return Err(err("Claude CLI batch response has a duplicate id"));
+            }
+            if texts.len() != item.destinations.len() {
+                return Err(err("Claude CLI batch response has mismatched languages"));
+            }
+            let mut out = Vec::with_capacity(item.destinations.len());
+            for lang in &item.destinations {
+                let text = texts
+                    .get(lang.code())
+                    .ok_or_else(|| err("Claude CLI batch response has mismatched languages"))?
+                    .as_str()
+                    .ok_or_else(batch_malformed)?;
+                if text.trim().is_empty() && !item.text.trim().is_empty() {
+                    return Err(err("Claude CLI batch response has an empty translation"));
+                }
+                out.push((*lang, text.to_string()));
+            }
+            by_id.insert(id, out);
+        }
+        let items = req
+            .items
+            .iter()
+            .map(|i| {
+                by_id
+                    .remove(i.id.as_str())
+                    .map(|t| (i.id.clone(), t))
+                    .ok_or_else(|| err("Claude CLI batch response is missing ids"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BatchTranslationResult { items })
+    }
+
+    fn correct_batch(
+        &self,
+        req: &BatchCorrectionRequest,
+    ) -> Result<BatchCorrectionResult, LlmError> {
+        let parsed = self.ask_json(&batch_correction_prompt(req, &self.model))?;
+        let entries = batch_entries(&parsed, "corrections")?;
+        let mut by_id: HashMap<&str, String> = HashMap::new();
+        for entry in entries {
+            let (id, corrected) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .zip(entry.get("corrected").and_then(Value::as_str))
+                .ok_or_else(batch_malformed)?;
+            let item = req
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .ok_or_else(|| err("Claude CLI batch response has an unknown id"))?;
+            if by_id.contains_key(id) {
+                return Err(err("Claude CLI batch response has a duplicate id"));
+            }
+            if corrected.trim().is_empty() && !item.text.trim().is_empty() {
+                return Err(err("Claude CLI batch response has an empty correction"));
+            }
+            by_id.insert(id, corrected.to_string());
+        }
+        let items = req
+            .items
+            .iter()
+            .map(|i| {
+                by_id
+                    .remove(i.id.as_str())
+                    .map(|t| (i.id.clone(), t))
+                    .ok_or_else(|| err("Claude CLI batch response is missing ids"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BatchCorrectionResult { items })
     }
 
     fn correct_sentences(
@@ -337,6 +452,223 @@ mod tests {
                 msg(p.correct_sentences(&creq())),
                 "Claude CLI returned a malformed correction response"
             );
+        }
+    }
+
+    fn bitem(id: &str, text: &str, dests: &[Lang]) -> ct_core::BatchItem {
+        ct_core::BatchItem {
+            id: id.into(),
+            text: text.into(),
+            source: Lang::Ko,
+            destinations: dests.to_vec(),
+        }
+    }
+
+    fn breq(items: Vec<ct_core::BatchItem>) -> ct_core::BatchTranslationRequest {
+        ct_core::BatchTranslationRequest {
+            items,
+            tone: Tone::Neutral,
+        }
+    }
+
+    fn one(dests: &[Lang]) -> ct_core::BatchTranslationRequest {
+        breq(vec![bitem("c0", "가", dests)])
+    }
+
+    #[test]
+    fn batch_prompt_embeds_items_as_json_and_keeps_placeholder_rule() {
+        let t = fake(result(
+            r#"{"translations":[{"id":"c0","texts":{"en":"x"}}]}"#,
+        ));
+        let p = ClaudeCliProvider::new(t.clone(), String::new());
+        p.translate_batch(&breq(vec![bitem("c0", "a\tb\n\"q\" ⟦0⟧", &[Lang::En])]))
+            .unwrap();
+        let prompts = t.prompts.lock().unwrap();
+        assert!(prompts[0].contains(r#""id": "c0""#));
+        assert!(prompts[0].contains("⟦"));
+        assert!(prompts[0].contains("\\t") && prompts[0].contains("\\n"));
+    }
+
+    #[test]
+    fn batch_prompt_uses_soft_formatting_only_for_haiku() {
+        let body = r#"{"translations":[{"id":"c0","texts":{"en":"x"}}]}"#;
+        let strict = fake(result(body));
+        let soft = fake(result(body));
+        ClaudeCliProvider::new(strict.clone(), "sonnet".into())
+            .translate_batch(&one(&[Lang::En]))
+            .unwrap();
+        ClaudeCliProvider::new(soft.clone(), "haiku".into())
+            .translate_batch(&one(&[Lang::En]))
+            .unwrap();
+        assert!(strict.prompts.lock().unwrap()[0].contains("never reformat"));
+        assert!(!soft.prompts.lock().unwrap()[0].contains("never reformat"));
+    }
+
+    #[test]
+    fn batch_prompt_includes_tone_instruction() {
+        let t = fake(result(
+            r#"{"translations":[{"id":"c0","texts":{"en":"x"}}]}"#,
+        ));
+        let mut r = one(&[Lang::En]);
+        r.tone = Tone::Formal;
+        ClaudeCliProvider::new(t.clone(), String::new())
+            .translate_batch(&r)
+            .unwrap();
+        assert!(t.prompts.lock().unwrap()[0].contains("formal"));
+    }
+
+    #[test]
+    fn batch_success_returns_translations_in_request_order() {
+        let p = provider(result(
+            r#"{"translations":[{"id":"c1","texts":{"ja":"B","en":"b"}},{"id":"c0","texts":{"en":"A"}}]}"#,
+        ));
+        let r = p
+            .translate_batch(&breq(vec![
+                bitem("c0", "가", &[Lang::En]),
+                bitem("c1", "나", &[Lang::En, Lang::Ja]),
+            ]))
+            .unwrap();
+        assert_eq!(
+            r.items,
+            vec![
+                ("c0".to_string(), vec![(Lang::En, "A".to_string())]),
+                (
+                    "c1".to_string(),
+                    vec![(Lang::En, "b".to_string()), (Lang::Ja, "B".to_string())]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_translation_rejects_wrong_language_keys() {
+        for body in [
+            r#"{"translations":[{"id":"c0","texts":{"en":"x"}}]}"#,
+            r#"{"translations":[{"id":"c0","texts":{"en":"x","ko":"y"}}]}"#,
+            r#"{"translations":[{"id":"c0","texts":{"en":"x","fr":"y"}}]}"#,
+            r#"{"translations":[{"id":"c0","texts":["x","y"]}]}"#,
+            r#"{"translations":[{"id":"c0","texts":{"en":"x","ja":5}}]}"#,
+            r#"{"translations":[{"id":"c0","texts":{"en":"x","ja":" "}}]}"#,
+        ] {
+            let p = provider(result(body));
+            assert!(
+                p.translate_batch(&one(&[Lang::En, Lang::Ja])).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_translation_violations_use_exact_messages() {
+        let cases = [
+            (
+                r#"{"translations":[]}"#,
+                "Claude CLI batch response is missing ids",
+            ),
+            (
+                r#"{"translations":[{"id":"c0","texts":{"en":"x"}},{"id":"c0","texts":{"en":"y"}}]}"#,
+                "Claude CLI batch response has a duplicate id",
+            ),
+            (
+                r#"{"translations":[{"id":"c0","texts":{"en":"x"}},{"id":"zz","texts":{"en":"y"}}]}"#,
+                "Claude CLI batch response has an unknown id",
+            ),
+            (
+                r#"{"translations":[{"id":"c0","texts":{"en":""}}]}"#,
+                "Claude CLI batch response has an empty translation",
+            ),
+            (
+                r#"{"translations":[{"id":"c0","texts":{"en":5}}]}"#,
+                "Claude CLI batch response has a malformed entry",
+            ),
+            (
+                r#"{"translations":[{"id":0,"texts":{"en":"x"}}]}"#,
+                "Claude CLI batch response has a malformed entry",
+            ),
+            (
+                r#"{"translations":["c0"]}"#,
+                "Claude CLI batch response has a malformed entry",
+            ),
+            (
+                r#"{"translations":"nope"}"#,
+                "Claude CLI batch response missing 'translations' list",
+            ),
+            (
+                r#"{"translation":"x"}"#,
+                "Claude CLI batch response missing 'translations' list",
+            ),
+            ("not json", "Claude CLI returned a malformed JSON response"),
+        ];
+        for (body, expected) in cases {
+            let p = provider(result(body));
+            assert_eq!(
+                msg(p.translate_batch(&one(&[Lang::En]))),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_translation_allows_blank_result_for_blank_source() {
+        let p = provider(result(
+            r#"{"translations":[{"id":"c0","texts":{"en":""}}]}"#,
+        ));
+        let r = p
+            .translate_batch(&breq(vec![bitem("c0", "  ", &[Lang::En])]))
+            .unwrap();
+        assert_eq!(r.items[0].1, vec![(Lang::En, String::new())]);
+    }
+
+    fn cbreq(ids: &[&str]) -> ct_core::BatchCorrectionRequest {
+        ct_core::BatchCorrectionRequest {
+            items: ids
+                .iter()
+                .map(|id| ct_core::BatchCorrectionItem {
+                    id: (*id).into(),
+                    text: "가".into(),
+                })
+                .collect(),
+            mode: CorrectionMode::Spelling,
+        }
+    }
+
+    #[test]
+    fn batch_correction_success_and_violations() {
+        let p = provider(result(
+            r#"{"corrections":[{"id":"c1","corrected":"B"},{"id":"c0","corrected":"A"}]}"#,
+        ));
+        let r = p.correct_batch(&cbreq(&["c0", "c1"])).unwrap();
+        assert_eq!(
+            r.items,
+            vec![("c0".into(), "A".into()), ("c1".into(), "B".into())]
+        );
+
+        let cases = [
+            (
+                r#"{"corrections":[]}"#,
+                "Claude CLI batch response is missing ids",
+            ),
+            (
+                r#"{"corrections":[{"id":"c0","corrected":""}]}"#,
+                "Claude CLI batch response has an empty correction",
+            ),
+            (
+                r#"{"corrections":[{"id":"c0","corrected":1}]}"#,
+                "Claude CLI batch response has a malformed entry",
+            ),
+            (
+                r#"{"corrections":[{"id":"q","corrected":"x"}]}"#,
+                "Claude CLI batch response has an unknown id",
+            ),
+            (
+                r#"{"translations":[]}"#,
+                "Claude CLI batch response missing 'corrections' list",
+            ),
+        ];
+        for (body, expected) in cases {
+            let p = provider(result(body));
+            assert_eq!(msg(p.correct_batch(&cbreq(&["c0"]))), expected, "{body}");
         }
     }
 
