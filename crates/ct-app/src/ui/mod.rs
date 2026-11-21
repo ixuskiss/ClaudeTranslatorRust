@@ -16,7 +16,8 @@ pub mod tray;
 pub mod win32;
 
 pub(crate) use generated::{
-    BadgeWin, DictRow, DictionaryWin, ExplainCard, ExplainLine, ExplainWin, SettingsWin, TargetRow,
+    BadgeWin, DictRow, DictionaryWin, ExplainCard, ExplainLine, ExplainWin, SettingsWin, SheetCell,
+    SheetRow, TargetRow,
 };
 
 pub use badge::BadgeWindow;

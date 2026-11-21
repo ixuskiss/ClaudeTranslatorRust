@@ -5,13 +5,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use ct_core::{CorrectionSentence, DisplayMode, ExplanationResult, Lang};
+use ct_sheets::{SheetsTable, column_letters, range_origin};
 use slint::winit_030::WinitWindowAccessor;
 use slint::winit_030::winit::window::ResizeDirection;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use windows::Win32::Foundation::HWND;
 
 use super::win32::{HWND_RETRIES, bring_to_front, hwnd_of, wait_for_hwnd, work_area_of};
-use super::{ExplainCard, ExplainLine, ExplainWin};
+use super::{ExplainCard, ExplainLine, ExplainWin, SheetCell, SheetRow};
 use crate::flows::{ExplainView, Notifier};
 
 /// Pure view state rendered by the explanation window.
@@ -19,6 +20,8 @@ use crate::flows::{ExplainView, Notifier};
 pub struct ExplainViewState {
     pub status: Option<String>,
     pub blocks: Vec<ExplainBlock>,
+    /// Sheets table view; replaces the cards while present.
+    pub table: Option<SheetTableView>,
 }
 
 /// One white card: the original text and its translations.
@@ -96,6 +99,7 @@ pub fn build_view_state(result: &ExplanationResult, mode: DisplayMode) -> Explai
     ExplainViewState {
         status: None,
         blocks,
+        table: None,
     }
 }
 
@@ -124,13 +128,87 @@ pub fn build_correction_view_state(
     ExplainViewState {
         status: None,
         blocks,
+        table: None,
     }
+}
+
+/// Sheets table (S-ref 7.2): caption, headers and one optional view per cell.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SheetTableView {
+    pub caption: Option<String>,
+    pub col_headers: Vec<String>,
+    pub row_headers: Vec<String>,
+    /// `rows[r][c]`; `None` = empty cell (no widget).
+    pub rows: Vec<Vec<Option<SheetCellView>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetCellView {
+    pub original: String,
+    /// Language tag only when the cell has 2+ results; correction lines are untagged.
+    pub lines: Vec<(Option<&'static str>, String)>,
+}
+
+pub fn build_table_view(table: &SheetsTable) -> SheetTableView {
+    let loc = &table.location;
+    let caption = [
+        loc.gid.as_deref().map(|g| format!("gid {g}")),
+        loc.range_address.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| !p.is_empty())
+    .collect::<Vec<_>>()
+    .join(" \u{b7} ");
+    let (first_row, first_col) = range_origin(loc.range_address.as_deref());
+    let mut rows: Vec<Vec<Option<SheetCellView>>> = vec![vec![None; table.cols]; table.rows];
+    for cell in &table.cells {
+        let Some(slot) = rows.get_mut(cell.row).and_then(|r| r.get_mut(cell.col)) else {
+            continue;
+        };
+        if cell.original.is_empty() && cell.results.is_empty() {
+            continue;
+        }
+        let tagged = cell.results.len() >= 2;
+        *slot = Some(SheetCellView {
+            original: cell.original.clone(),
+            lines: cell
+                .results
+                .iter()
+                .map(|(lang, text)| (lang.filter(|_| tagged).map(tag), text.clone()))
+                .collect(),
+        });
+    }
+    SheetTableView {
+        caption: (!caption.is_empty()).then_some(caption),
+        col_headers: (0..table.cols)
+            .map(|c| column_letters(first_col + c))
+            .collect(),
+        row_headers: (0..table.rows)
+            .map(|r| (first_row + r + 1).to_string())
+            .collect(),
+        rows,
+    }
+}
+
+pub fn table_state(table: &SheetsTable) -> ExplainViewState {
+    ExplainViewState {
+        table: Some(build_table_view(table)),
+        ..ExplainViewState::default()
+    }
+}
+
+/// Table window size: `content + (60, 130)` clamped like `fit_size` (S-ref 7.2-7).
+pub fn table_size(content: (f32, f32), avail: Option<(f32, f32)>) -> (f32, f32) {
+    // `fit_size` adds (40, 80); top up to (60, 130).
+    fit_size((content.0 + 20.0, content.1 + 50.0), avail)
 }
 
 pub fn loading_state(text: &str) -> ExplainViewState {
     ExplainViewState {
         status: Some(text.to_string()),
         blocks: Vec::new(),
+        table: None,
     }
 }
 
@@ -139,6 +217,7 @@ pub fn error_state(message: &str) -> ExplainViewState {
     ExplainViewState {
         status: Some(format!("Error: {message}")),
         blocks: Vec::new(),
+        table: None,
     }
 }
 
@@ -226,9 +305,85 @@ const REFIT_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
 struct SlintSurface {
     win: ExplainWin,
     hwnd: Rc<Cell<Option<HWND>>>,
+    /// Whether the last applied state is a table (selects the sizing rule).
+    has_table: Cell<bool>,
 }
 
 impl SlintSurface {
+    fn size_for(&self, content: (f32, f32), avail: Option<(f32, f32)>) -> (f32, f32) {
+        if self.has_table.get() {
+            table_size(content, avail)
+        } else {
+            fit_size(content, avail)
+        }
+    }
+
+    /// Pushes the table (or clears it) into the Slint properties.
+    fn apply_table(&self, table: Option<&SheetTableView>) {
+        let Some(t) = table else {
+            self.win.set_has_table(false);
+            self.win.set_table_caption("".into());
+            self.win.set_col_headers(ModelRc::default());
+            self.win.set_table_rows(ModelRc::default());
+            return;
+        };
+        let strings = |v: &[String]| {
+            ModelRc::new(VecModel::from(
+                v.iter()
+                    .map(|s| s.as_str().into())
+                    .collect::<Vec<slint::SharedString>>(),
+            ))
+        };
+        let rows: Vec<SheetRow> = t
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, cells)| SheetRow {
+                header: t
+                    .row_headers
+                    .get(r)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .into(),
+                cells: ModelRc::new(VecModel::from(
+                    cells
+                        .iter()
+                        .map(|c| match c {
+                            None => SheetCell {
+                                present: false,
+                                original: "".into(),
+                                lines: ModelRc::default(),
+                            },
+                            Some(c) => SheetCell {
+                                present: true,
+                                original: c.original.as_str().into(),
+                                lines: ModelRc::new(VecModel::from(
+                                    c.lines
+                                        .iter()
+                                        .map(|(tag, text)| ExplainLine {
+                                            tag: tag.unwrap_or_default().into(),
+                                            text: text.as_str().into(),
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )),
+                            },
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            })
+            .collect();
+        tracing::debug!(
+            rows = rows.len(),
+            cols = t.col_headers.len(),
+            "explain window: table applied"
+        );
+        self.win
+            .set_table_caption(t.caption.clone().unwrap_or_default().into());
+        self.win.set_col_headers(strings(&t.col_headers));
+        self.win.set_table_rows(ModelRc::new(VecModel::from(rows)));
+        self.win.set_has_table(true);
+    }
+
     /// Available work area of the window's monitor in logical px.
     fn avail(&self) -> Option<(f32, f32)> {
         let hwnd = self.hwnd.get()?;
@@ -260,20 +415,28 @@ impl ExplainSurface for SlintSurface {
             .collect();
         tracing::debug!(blocks = cards.len(), "explain window: state applied");
         self.win.set_cards(ModelRc::new(VecModel::from(cards)));
+        self.has_table.set(state.table.is_some());
+        self.apply_table(state.table.as_ref());
     }
 
     fn fit_to_content(&self) {
         let avail = self.avail();
-        let (w, h) = fit_size(
+        let (w, h) = self.size_for(
             (self.win.get_content_width(), self.win.get_content_height()),
             avail,
         );
         self.win.window().set_size(slint::LogicalSize::new(w, h));
         // Wrapped text height depends on the width just set: re-measure once laid out.
         let weak = self.win.as_weak();
+        let table = self.has_table.get();
         slint::Timer::single_shot(REFIT_DELAY, move || {
             if let Some(win) = weak.upgrade() {
-                let (_, h) = fit_size((0.0, win.get_content_height()), avail);
+                let content = (0.0, win.get_content_height());
+                let (_, h) = if table {
+                    table_size(content, avail)
+                } else {
+                    fit_size(content, avail)
+                };
                 win.window().set_size(slint::LogicalSize::new(w, h));
             }
         });
@@ -364,6 +527,7 @@ impl SurfaceFactory for SlintFactory {
         Ok(SlintSurface {
             win,
             hwnd: Rc::new(Cell::new(None)),
+            has_table: Cell::new(false),
         })
     }
 }
@@ -417,9 +581,9 @@ impl ExplainView for ExplainWindow {
         self.dispatch(build_correction_view_state(&sentences, mode), Present::Fit);
     }
 
-    /// Temporary: the table view is drawn by a later task.
-    fn show_table(&self, _table: ct_sheets::SheetsTable) {
-        tracing::warn!("sheets table view not implemented yet");
+    /// A result display: fit, never re-show a closed window.
+    fn show_table(&self, table: SheetsTable) {
+        self.dispatch(table_state(&table), Present::Fit);
     }
 }
 
@@ -641,5 +805,188 @@ mod tests {
         assert_eq!(log.created, 1);
         assert_eq!(log.fronts, 2);
         assert_eq!(log.fits, 0);
+    }
+
+    // ---- Sheets table view ----
+
+    use ct_sheets::{SheetLocation, SheetsTable, TableCell};
+
+    fn cell(row: usize, col: usize, original: &str, results: &[(Option<Lang>, &str)]) -> TableCell {
+        TableCell {
+            row,
+            col,
+            original: original.into(),
+            results: results
+                .iter()
+                .map(|(l, t)| (*l, (*t).to_string()))
+                .collect(),
+        }
+    }
+
+    fn table(
+        gid: Option<&str>,
+        addr: Option<&str>,
+        rows: usize,
+        cols: usize,
+        cells: Vec<TableCell>,
+    ) -> SheetsTable {
+        SheetsTable {
+            location: SheetLocation {
+                document_id: "doc".into(),
+                gid: gid.map(String::from),
+                range_address: addr.map(String::from),
+            },
+            rows,
+            cols,
+            cells,
+        }
+    }
+
+    #[test]
+    fn caption_is_gid_and_address() {
+        let v = build_table_view(&table(Some("0"), Some("A1:C3"), 1, 1, vec![]));
+        assert_eq!(v.caption.as_deref(), Some("gid 0 \u{b7} A1:C3"));
+        let v = build_table_view(&table(Some("7"), None, 1, 1, vec![]));
+        assert_eq!(v.caption.as_deref(), Some("gid 7"));
+        let v = build_table_view(&table(None, Some("B2"), 1, 1, vec![]));
+        assert_eq!(v.caption.as_deref(), Some("B2"));
+        let v = build_table_view(&table(None, None, 1, 1, vec![]));
+        assert_eq!(v.caption, None);
+    }
+
+    #[test]
+    fn headers_start_at_range_origin() {
+        let v = build_table_view(&table(None, Some("C5:D6"), 2, 2, vec![]));
+        assert_eq!(v.col_headers, vec!["C", "D"]);
+        assert_eq!(v.row_headers, vec!["5", "6"]);
+    }
+
+    #[test]
+    fn headers_fall_back_to_positions_when_range_unknown() {
+        let v = build_table_view(&table(None, None, 2, 3, vec![]));
+        assert_eq!(v.col_headers, vec!["A", "B", "C"]);
+        assert_eq!(v.row_headers, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn layout_is_preserved_and_empty_cell_has_no_view() {
+        let cells = vec![
+            cell(0, 0, "안녕", &[(Some(Lang::En), "Hello")]),
+            cell(0, 1, "42", &[]),
+            cell(0, 2, "", &[]),
+            cell(1, 2, "합계", &[(Some(Lang::En), "Total")]),
+        ];
+        let v = build_table_view(&table(Some("0"), Some("B2:D3"), 2, 3, cells));
+        assert_eq!((v.rows.len(), v.rows[0].len()), (2, 3));
+        assert_eq!(
+            v.rows[0][0],
+            Some(SheetCellView {
+                original: "안녕".into(),
+                lines: vec![(None, "Hello".into())]
+            })
+        );
+        // Untranslated cell shows only its display value.
+        assert_eq!(
+            v.rows[0][1],
+            Some(SheetCellView {
+                original: "42".into(),
+                lines: vec![]
+            })
+        );
+        assert!(v.rows[0][2].is_none());
+        assert!(v.rows[1][0].is_none());
+        assert!(v.rows[1][1].is_none());
+        assert!(v.rows[1][2].is_some());
+    }
+
+    #[test]
+    fn empty_cell_without_result_has_no_view() {
+        let v = build_table_view(&table(None, None, 1, 1, vec![cell(0, 0, "", &[])]));
+        assert_eq!(v.rows, vec![vec![None]]);
+    }
+
+    #[test]
+    fn multiline_and_markup_stay_literal() {
+        let cells = vec![cell(
+            0,
+            0,
+            "<b>x</b>\n둘째",
+            &[(Some(Lang::En), "<i>z</i>\nSecond")],
+        )];
+        let v = build_table_view(&table(None, None, 1, 1, cells));
+        let c = v.rows[0][0].as_ref().unwrap();
+        assert_eq!(c.original, "<b>x</b>\n둘째");
+        assert_eq!(c.lines, vec![(None, "<i>z</i>\nSecond".into())]);
+    }
+
+    #[test]
+    fn translation_tags_only_with_two_or_more_languages() {
+        let cells = vec![cell(
+            0,
+            0,
+            "안녕",
+            &[(Some(Lang::En), "Hi"), (Some(Lang::Ja), "やあ")],
+        )];
+        let v = build_table_view(&table(None, None, 1, 1, cells));
+        assert_eq!(
+            v.rows[0][0].as_ref().unwrap().lines,
+            vec![(Some("EN"), "Hi".into()), (Some("JA"), "やあ".into())]
+        );
+        let cells = vec![cell(0, 0, "안녕", &[(Some(Lang::En), "Hi")])];
+        let v = build_table_view(&table(None, None, 1, 1, cells));
+        assert_eq!(
+            v.rows[0][0].as_ref().unwrap().lines,
+            vec![(None, "Hi".into())]
+        );
+    }
+
+    #[test]
+    fn correction_cell_has_untagged_line() {
+        let cells = vec![cell(0, 0, "가", &[(None, "가.")])];
+        let v = build_table_view(&table(None, None, 1, 1, cells));
+        assert_eq!(
+            v.rows[0][0].as_ref().unwrap().lines,
+            vec![(None, "가.".into())]
+        );
+    }
+
+    #[test]
+    fn cells_outside_grid_are_ignored() {
+        let cells = vec![cell(5, 5, "x", &[])];
+        let v = build_table_view(&table(None, None, 1, 1, cells));
+        assert_eq!(v.rows, vec![vec![None]]);
+    }
+
+    #[test]
+    fn table_size_clamps_with_table_padding() {
+        let avail = Some((1920.0, 1040.0));
+        assert_eq!(table_size((10.0, 10.0), avail), (480.0, 240.0));
+        assert_eq!(table_size((500.0, 300.0), avail), (560.0, 430.0));
+        assert_eq!(table_size((5000.0, 5000.0), avail), (700.0, 800.0));
+        assert_eq!(
+            table_size((5000.0, 5000.0), Some((600.0, 500.0))),
+            (560.0, 420.0)
+        );
+        assert_eq!(table_size((500.0, 300.0), None), (560.0, 430.0));
+    }
+
+    #[test]
+    fn table_is_shown_with_fit_and_cleared_by_later_states() {
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut host = ExplainHost::new(FakeFactory(log.clone()));
+        let t = table_state(&table(Some("0"), None, 1, 1, vec![cell(0, 0, "a", &[])]));
+        assert!(t.table.is_some() && t.blocks.is_empty() && t.status.is_none());
+        host.present(&t, Present::Fit);
+        host.present(&loading_state("x"), Present::Front);
+        host.present(&error_state("x"), Present::Front);
+        host.present(
+            &build_view_state(&two_sentences(), DisplayMode::WholeText),
+            Present::Fit,
+        );
+        let log = log.borrow();
+        assert_eq!(log.fronts, 2);
+        assert_eq!(log.fits, 2);
+        assert!(log.applied[0].table.is_some());
+        assert!(log.applied[1..].iter().all(|s| s.table.is_none()));
     }
 }
