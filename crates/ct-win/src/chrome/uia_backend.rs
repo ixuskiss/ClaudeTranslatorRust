@@ -139,32 +139,8 @@ impl WindowsUiaBackend {
 impl UiaBackend for WindowsUiaBackend {
     fn focused_element(&self) -> Option<FocusedElement> {
         let window = ChromeWindow::foreground()?;
-        wait_until_alt_released(self.keys.as_ref(), ALT_RELEASE_TIMEOUT);
-
         let url = window.url();
-        // AutomationId는 Sheets URL일 때만 읽는다(S-ref §1.3).
-        let read_id = is_google_sheets_url(&url);
-        let mut focused = window.focused(read_id)?;
-        let mut role = focused.classify(&url);
-
-        if needs_toolbar_recovery(focused.control_type, role, &url) {
-            let recovered = url.contains("docs.google.com") && window.focus_render_widget();
-            if !recovered {
-                // Docs/Slides에서는 Esc가 텍스트 선택을 지우므로 SetFocus가 실패했을 때만 온다.
-                if send_chord(self.keys.as_ref(), Chord::Esc).is_err() {
-                    tracing::debug!("escape recovery key failed");
-                }
-                sleep(ESCAPE_RECOVERY_DELAY);
-            }
-            // 복구 뒤 포커스를 다시 못 읽으면 툴바 버튼에 Ctrl+C를 보내지 않고 중단한다(v5 §2.6 1e/1g).
-            let Some(f) = window.focused(read_id) else {
-                tracing::debug!(recovered, "toolbar focus recovery: focus unreadable");
-                return None;
-            };
-            focused = f;
-            role = focused.classify(&url);
-            tracing::debug!(recovered, ?role, "toolbar focus recovery");
-        }
+        let (focused, role) = resolve_focus(&window, self.keys.as_ref(), &url)?;
 
         if is_sheets_editor_role(role) {
             return Some(self.sheets_editor_element(url, role, focused));
@@ -231,6 +207,40 @@ impl WindowsUiaBackend {
     }
 }
 
+/// UI-ref 2.6 포커스 해석: Alt 해제 대기(<= 0.5초), 포커스 읽기와 역할 분류, 툴바 포커스 복구.
+/// 복구 뒤에도 포커스를 못 읽으면 None이다. 텍스트 경로와 Sheets 라우팅이 함께 쓴다.
+pub(crate) fn resolve_focus(
+    window: &ChromeWindow,
+    keys: &dyn KeySender,
+    url: &str,
+) -> Option<(Focused, Role)> {
+    wait_until_alt_released(keys, ALT_RELEASE_TIMEOUT);
+    // AutomationId는 Sheets URL일 때만 읽는다(S-ref §1.3).
+    let read_id = is_google_sheets_url(url);
+    let mut focused = window.focused(read_id)?;
+    let mut role = focused.classify(url);
+
+    if needs_toolbar_recovery(focused.control_type, role, url) {
+        let recovered = url.contains("docs.google.com") && window.focus_render_widget();
+        if !recovered {
+            // Docs/Slides에서는 Esc가 텍스트 선택을 지우므로 SetFocus가 실패했을 때만 온다.
+            if send_chord(keys, Chord::Esc).is_err() {
+                tracing::debug!("escape recovery key failed");
+            }
+            sleep(ESCAPE_RECOVERY_DELAY);
+        }
+        // 복구 뒤 포커스를 다시 못 읽으면 툴바 버튼에 Ctrl+C를 보내지 않고 중단한다(v5 §2.6 1e/1g).
+        let Some(f) = window.focused(read_id) else {
+            tracing::debug!(recovered, "toolbar focus recovery: focus unreadable");
+            return None;
+        };
+        focused = f;
+        role = focused.classify(url);
+        tracing::debug!(recovered, ?role, "toolbar focus recovery");
+    }
+    Some((focused, role))
+}
+
 /// Alt가 떼지기를 기다린 뒤 키를 보낸다(Alt가 눌린 채면 Alt+Esc 등 창 전환이 된다).
 fn send_chord(keys: &dyn KeySender, chord: Chord) -> Result<(), String> {
     wait_until_alt_released(keys, ALT_RELEASE_TIMEOUT);
@@ -270,7 +280,7 @@ fn copy_editor_selection(
 }
 
 /// ValuePattern 값 끝의 `\n` 하나만 지운다(Sheets 편집기가 붙인다).
-fn strip_one_trailing_newline(mut value: String) -> String {
+pub(crate) fn strip_one_trailing_newline(mut value: String) -> String {
     if value.ends_with('\n') {
         value.pop();
     }
@@ -348,13 +358,13 @@ fn class_name(hwnd: HWND) -> String {
 }
 
 /// 포그라운드 Chrome 창의 UIA 요소. 만든 스레드 안에서만 쓴다.
-struct ChromeWindow {
+pub(crate) struct ChromeWindow {
     uia: IUIAutomation,
     element: IUIAutomationElement,
 }
 
 impl ChromeWindow {
-    fn foreground() -> Option<ChromeWindow> {
+    pub(crate) fn foreground() -> Option<ChromeWindow> {
         // SAFETY: 인자 없는 조회 함수.
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.is_invalid() || !class_name(hwnd).starts_with(CHROME_CLASS_PREFIX) {
@@ -368,7 +378,7 @@ impl ChromeWindow {
     }
 
     /// omnibox 텍스트(스킴이 빠질 수 있다). ValuePattern → Name → 빈 문자열.
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         let Some(omnibox) = self.find(OMNIBOX_CLASS, UIA_EditControlTypeId, OMNIBOX_SEARCH_DEPTH)
         else {
             return String::new();
@@ -431,14 +441,51 @@ impl ChromeWindow {
         control_type: UIA_CONTROLTYPE_ID,
         max_depth: u32,
     ) -> Option<IUIAutomationElement> {
+        self.find_where(max_depth, &|el| {
+            // SAFETY: 이 스레드에서 얻은 요소에 대한 조회 호출.
+            unsafe {
+                el.CurrentControlType().is_ok_and(|c| c == control_type)
+                    && el.CurrentClassName().is_ok_and(|c| c == class)
+            }
+        })
+    }
+
+    /// `is_match`를 만족하는 첫 요소(깊이 제한 전위 순회, 자식이 깊이 1).
+    fn find_where(
+        &self,
+        max_depth: u32,
+        is_match: &dyn Fn(&IUIAutomationElement) -> bool,
+    ) -> Option<IUIAutomationElement> {
         // SAFETY: 이 스레드의 UIA로 만든다.
         let walker = unsafe { self.uia.ControlViewWalker() }.ok()?;
-        find_in(&walker, &self.element, class, control_type, 1, max_depth)
+        find_in(&walker, &self.element, is_match, 1, max_depth)
+    }
+
+    /// `is_match`를 만족하는 첫 EditControl의 ValuePattern 값.
+    /// 요소가 없거나 값을 못 읽으면 None.
+    pub(crate) fn edit_value_where(
+        &self,
+        max_depth: u32,
+        is_match: &dyn Fn(&IUIAutomationElement) -> bool,
+    ) -> Option<String> {
+        let el = self.find_where(max_depth, &|el| {
+            // SAFETY: 이 스레드에서 얻은 요소에 대한 조회 호출.
+            let is_edit =
+                unsafe { el.CurrentControlType() }.is_ok_and(|c| c == UIA_EditControlTypeId);
+            is_edit && is_match(el)
+        })?;
+        // SAFETY: 이 스레드에서 얻은 요소에 대한 조회 호출.
+        unsafe {
+            let pattern = el
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                .ok()?;
+            pattern.CurrentValue().ok().map(|v| v.to_string())
+        }
     }
 }
 
 /// 포커스된 UIA 요소 스냅샷. 만든 스레드 안에서만 쓴다.
-struct Focused {
+pub(crate) struct Focused {
     element: IUIAutomationElement,
     name: String,
     control_type: &'static str,
@@ -452,7 +499,7 @@ impl Focused {
     }
 
     /// ValuePattern 값. 읽지 못하면 None.
-    fn value(&self) -> Option<String> {
+    pub(crate) fn value(&self) -> Option<String> {
         // SAFETY: 이 스레드에서 얻은 요소에 대한 조회 호출.
         unsafe {
             let pattern = self
@@ -467,8 +514,7 @@ impl Focused {
 fn find_in(
     walker: &IUIAutomationTreeWalker,
     parent: &IUIAutomationElement,
-    class: &str,
-    control_type: UIA_CONTROLTYPE_ID,
+    is_match: &dyn Fn(&IUIAutomationElement) -> bool,
     depth: u32,
     max_depth: u32,
 ) -> Option<IUIAutomationElement> {
@@ -476,13 +522,11 @@ fn find_in(
     unsafe {
         let mut child = walker.GetFirstChildElement(parent).ok();
         while let Some(el) = child {
-            let is_match = el.CurrentControlType().is_ok_and(|c| c == control_type)
-                && el.CurrentClassName().is_ok_and(|c| c == class);
-            if is_match {
+            if is_match(&el) {
                 return Some(el);
             }
             if depth < max_depth
-                && let Some(found) = find_in(walker, &el, class, control_type, depth + 1, max_depth)
+                && let Some(found) = find_in(walker, &el, is_match, depth + 1, max_depth)
             {
                 return Some(found);
             }

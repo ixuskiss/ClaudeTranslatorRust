@@ -1017,6 +1017,7 @@ dependencies = [
  "crossbeam-channel",
  "ct-core",
  "ct-sheets",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "windows",
