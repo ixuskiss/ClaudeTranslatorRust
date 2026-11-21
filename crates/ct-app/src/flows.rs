@@ -1,4 +1,5 @@
-//! Alt+Alt (translate and replace) and Ctrl+Ctrl (translate and explain) flows.
+//! Alt+Alt (translate and replace) and Ctrl+Ctrl (translate and explain) flows, plus the
+//! Korean correction flows. Each flow routes Google Sheets first (`sheets_flows`).
 //!
 //! The original text is replaced only after a successful translation, and any failure
 //! leaves it untouched. Logs carry operation, duration and error kind only, never text.
@@ -11,7 +12,14 @@ use ct_core::{
     TranslateError, UserSettings, correct_sentences, correct_text, explain_text, translate_text,
 };
 use ct_llm::CLI_START_FAILURE_MARKER;
+use ct_sheets::SheetsTable;
 use ct_win::chrome::{ReplaceError, TextInteraction};
+
+use crate::sheets_flows::{
+    Job, MSG_SHEETS_CORRECTION_RANGE_REPLACE_DISABLED, MSG_SHEETS_EDIT_CORRECT_FAILED,
+    MSG_SHEETS_EDIT_TRANSLATE_FAILED, MSG_SHEETS_RANGE_REPLACE_DISABLED, Routed, SheetsDeps, route,
+    run_range_replace, run_table, sheets_edit_replace_message,
+};
 
 pub const MSG_DIRECTION_UNKNOWN: &str = "번역 방향을 판단할 수 없어 원문을 변경하지 않았습니다.";
 pub const MSG_TRANSLATE_FAILED: &str = "번역에 실패하여 원본을 변경하지 않았습니다.";
@@ -27,7 +35,7 @@ pub const MSG_CORRECTION_VIEW_NO_SELECTION: &str =
     "텍스트를 선택한 후 Alt+Ctrl+Ctrl을 실행해주세요.";
 pub const MSG_CORRECTION_FAILED: &str = "교정에 실패하여 원본을 변경하지 않았습니다.";
 
-const LOADING_TEXT: &str = "Translating...";
+pub(crate) const LOADING_TEXT: &str = "Translating...";
 
 /// Shows an error in the explanation window ("Error: {message}").
 pub trait Notifier: Send + Sync {
@@ -44,6 +52,8 @@ pub trait ExplainView: Send + Sync {
     fn show_error(&self, message: &str);
     fn show_result(&self, result: ExplanationResult, mode: DisplayMode);
     fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode);
+    /// Google Sheets range result (translation or correction table).
+    fn show_table(&self, table: SheetsTable);
 }
 
 pub struct FlowDeps<'a> {
@@ -54,7 +64,7 @@ pub struct FlowDeps<'a> {
 }
 
 /// Hides the badge on every exit path, including panics.
-struct BadgeGuard<'a>(&'a dyn Badge);
+pub(crate) struct BadgeGuard<'a>(pub(crate) &'a dyn Badge);
 
 impl Drop for BadgeGuard<'_> {
     fn drop(&mut self) {
@@ -83,6 +93,15 @@ fn replace_error_kind(e: &ReplaceError) -> &'static str {
     }
 }
 
+/// User text for a failed text-path replace: the Sheets cell-edit message when one applies,
+/// otherwise the generic one.
+fn replace_failure_message(job: Job, on_sheets: bool, e: &ReplaceError) -> &'static str {
+    on_sheets
+        .then(|| sheets_edit_replace_message(job, e))
+        .flatten()
+        .unwrap_or(MSG_REPLACE_FAILED)
+}
+
 /// True when an LLM error message says the CLI process could not be started
 /// (`CliError::Spawn`, wrapped by the provider as "Claude CLI call failed: failed to start
 /// Claude CLI: ...").
@@ -104,11 +123,12 @@ fn translate_error_message(e: &TranslateError) -> &'static str {
 fn alt_alt_work(
     d: &FlowDeps,
     ti: &dyn TextInteraction,
-    docs_or_slides: &dyn Fn() -> bool,
+    no_capture_message: &dyn Fn() -> Option<&'static str>,
+    on_sheets: bool,
 ) -> Option<&'static str> {
     let Some(captured) = ti.capture() else {
         tracing::info!(operation = "alt_alt", status = "capture_failed");
-        return docs_or_slides().then_some(MSG_ALT_NO_SELECTION_DOCS);
+        return no_capture_message();
     };
     let s = d.settings;
     let translated = match translate_text(
@@ -140,23 +160,52 @@ fn alt_alt_work(
                 status = "replace_failed",
                 error = replace_error_kind(&e)
             );
-            Some(MSG_REPLACE_FAILED)
+            Some(replace_failure_message(Job::Translate, on_sheets, &e))
         }
     }
 }
 
+/// Alt+Alt. `no_capture_message` gives the message for a failed capture outside Sheets
+/// (e.g. the Docs/Slides hint, or `None` to stay silent).
 pub fn alt_alt_flow(
     d: &FlowDeps,
+    sheets: &SheetsDeps,
     ti: &dyn TextInteraction,
-    docs_or_slides: &dyn Fn() -> bool,
+    no_capture_message: &dyn Fn() -> Option<&'static str>,
     badge: &dyn Badge,
     notifier: &dyn Notifier,
 ) {
     let started = Instant::now();
+    let on_sheets = match route(sheets, "alt_alt", Some(MSG_SHEETS_RANGE_REPLACE_DISABLED)) {
+        Routed::Refuse(m) => {
+            notifier.notify(&m);
+            return;
+        }
+        Routed::Range => {
+            run_range_replace(
+                d,
+                sheets,
+                Job::Translate,
+                started,
+                badge,
+                LOADING_TEXT,
+                notifier,
+            );
+            return;
+        }
+        Routed::Text { on_sheets } => on_sheets,
+    };
+    let no_capture = || {
+        if on_sheets {
+            Some(MSG_SHEETS_EDIT_TRANSLATE_FAILED)
+        } else {
+            no_capture_message()
+        }
+    };
     badge.show(LOADING_TEXT);
     let message = {
         let _guard = BadgeGuard(badge);
-        alt_alt_work(d, ti, docs_or_slides)
+        alt_alt_work(d, ti, &no_capture, on_sheets)
     };
     tracing::info!(
         operation = "alt_alt",
@@ -169,8 +218,24 @@ pub fn alt_alt_flow(
     }
 }
 
-pub fn ctrl_ctrl_flow(d: &FlowDeps, ti: &dyn TextInteraction, view: &dyn ExplainView) {
+pub fn ctrl_ctrl_flow(
+    d: &FlowDeps,
+    sheets: &SheetsDeps,
+    ti: &dyn TextInteraction,
+    view: &dyn ExplainView,
+) {
     let started = Instant::now();
+    match route(sheets, "ctrl_ctrl", None) {
+        Routed::Refuse(m) => {
+            view.show_error(&m);
+            return;
+        }
+        Routed::Range => {
+            run_table(d, sheets, Job::Translate, started, view);
+            return;
+        }
+        Routed::Text { .. } => {}
+    }
     // Capture first: showing the window before capture would steal focus from the target.
     let Some(captured) = ti.capture() else {
         tracing::info!(operation = "ctrl_ctrl", status = "capture_failed");
@@ -215,10 +280,18 @@ fn correction_message(o: &CorrectionOutcome) -> &'static str {
 
 /// Work done while the badge is visible; the user message (if any) is sent after the
 /// badge is hidden.
-fn correction_replace_work(d: &FlowDeps, ti: &dyn TextInteraction) -> Option<&'static str> {
+fn correction_replace_work(
+    d: &FlowDeps,
+    ti: &dyn TextInteraction,
+    on_sheets: bool,
+) -> Option<&'static str> {
     let Some(captured) = ti.capture() else {
         tracing::info!(operation = "correction_replace", status = "capture_failed");
-        return Some(MSG_CORRECTION_REPLACE_NO_SELECTION);
+        return Some(if on_sheets {
+            MSG_SHEETS_EDIT_CORRECT_FAILED
+        } else {
+            MSG_CORRECTION_REPLACE_NO_SELECTION
+        });
     };
     let s = d.settings;
     let outcome = correct_text(
@@ -241,15 +314,17 @@ fn correction_replace_work(d: &FlowDeps, ti: &dyn TextInteraction) -> Option<&'s
                 status = "replace_failed",
                 error = replace_error_kind(&e)
             );
-            Some(MSG_REPLACE_FAILED)
+            Some(replace_failure_message(Job::Correct, on_sheets, &e))
         }
     }
 }
 
 /// Ctrl+Alt+Alt: correct the selection and replace it. `modifiers_released` waits (up to
-/// 2 seconds) until Ctrl and Alt are both up and reports whether they were.
+/// 2 seconds) until Ctrl and Alt are both up and reports whether they were. Sheets routing
+/// comes after the base check and the wait (v5 order).
 pub fn correction_replace_flow(
     d: &FlowDeps,
+    sheets: &SheetsDeps,
     ti: &dyn TextInteraction,
     modifiers_released: &dyn Fn() -> bool,
     badge: &dyn Badge,
@@ -265,10 +340,26 @@ pub fn correction_replace_flow(
         notifier.notify(MSG_CORRECTION_REPLACE_NO_SELECTION);
         return;
     }
-    badge.show(d.settings.korean_correction_mode.loading_message());
+    let loading = d.settings.korean_correction_mode.loading_message();
+    let on_sheets = match route(
+        sheets,
+        "correction_replace",
+        Some(MSG_SHEETS_CORRECTION_RANGE_REPLACE_DISABLED),
+    ) {
+        Routed::Refuse(m) => {
+            notifier.notify(&m);
+            return;
+        }
+        Routed::Range => {
+            run_range_replace(d, sheets, Job::Correct, started, badge, loading, notifier);
+            return;
+        }
+        Routed::Text { on_sheets } => on_sheets,
+    };
+    badge.show(loading);
     let message = {
         let _guard = BadgeGuard(badge);
-        correction_replace_work(d, ti)
+        correction_replace_work(d, ti, on_sheets)
     };
     tracing::info!(
         operation = "correction_replace",
@@ -282,8 +373,10 @@ pub fn correction_replace_flow(
 }
 
 /// Alt+Ctrl+Ctrl: correct the selection and show the result in the explanation window.
+/// Sheets routing comes after the base check and the wait (v5 order).
 pub fn correction_view_flow(
     d: &FlowDeps,
+    sheets: &SheetsDeps,
     ti: &dyn TextInteraction,
     modifiers_released: &dyn Fn() -> bool,
     view: &dyn ExplainView,
@@ -298,6 +391,17 @@ pub fn correction_view_flow(
         tracing::info!(operation = "correction_view", status = "modifiers_held");
         view.show_error(MSG_CORRECTION_VIEW_NO_SELECTION);
         return;
+    }
+    match route(sheets, "correction_view", None) {
+        Routed::Refuse(m) => {
+            view.show_error(&m);
+            return;
+        }
+        Routed::Range => {
+            run_table(d, sheets, Job::Correct, started, view);
+            return;
+        }
+        Routed::Text { .. } => {}
     }
     // Capture first: showing the window before capture would steal focus from the target.
     let Some(captured) = ti.capture() else {
@@ -329,24 +433,27 @@ pub fn correction_view_flow(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::sheets_flows::SheetsDeps;
+    use ct_core::SheetsConfig;
     use ct_core::llm::{
         CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationSentence, LlmError,
         TranslationRequest, TranslationResult,
     };
     use ct_core::{Action, Lang, RuleBasedDetector};
+    use ct_sheets::{SheetsInteraction, SheetsRouting, SheetsTable};
     use ct_win::chrome::{CapturedText, EditingContext};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    type Log = Arc<Mutex<Vec<String>>>;
+    pub(crate) type Log = Arc<Mutex<Vec<String>>>;
 
-    fn push(log: &Log, s: impl Into<String>) {
+    pub(crate) fn push(log: &Log, s: impl Into<String>) {
         log.lock().unwrap().push(s.into());
     }
 
-    fn snapshot(log: &Log) -> Vec<String> {
+    pub(crate) fn snapshot(log: &Log) -> Vec<String> {
         log.lock().unwrap().clone()
     }
 
@@ -434,17 +541,17 @@ mod tests {
         }
     }
 
-    struct FakeTi {
+    pub(crate) struct FakeTi {
         text: Option<String>,
-        replace_result: Result<(), ReplaceError>,
+        pub(crate) replace_err: Option<fn() -> ReplaceError>,
         log: Log,
     }
 
     impl FakeTi {
-        fn new(text: Option<&str>, log: &Log) -> Self {
+        pub(crate) fn new(text: Option<&str>, log: &Log) -> Self {
             FakeTi {
                 text: text.map(String::from),
-                replace_result: Ok(()),
+                replace_err: None,
                 log: log.clone(),
             }
         }
@@ -464,14 +571,14 @@ mod tests {
         }
         fn replace(&self, _: &CapturedText, new_text: &str) -> Result<(), ReplaceError> {
             push(&self.log, format!("replace:{new_text}"));
-            match &self.replace_result {
-                Ok(()) => Ok(()),
-                Err(_) => Err(ReplaceError::ContextChanged),
+            match self.replace_err {
+                None => Ok(()),
+                Some(err) => Err(err()),
             }
         }
     }
 
-    struct FakeBadge(Log);
+    pub(crate) struct FakeBadge(pub(crate) Log);
     impl Badge for FakeBadge {
         fn show(&self, text: &str) {
             push(&self.0, format!("show:{text}"));
@@ -481,14 +588,14 @@ mod tests {
         }
     }
 
-    struct FakeNotifier(Log);
+    pub(crate) struct FakeNotifier(pub(crate) Log);
     impl Notifier for FakeNotifier {
         fn notify(&self, m: &str) {
             push(&self.0, format!("notify:{m}"));
         }
     }
 
-    struct FakeView(Log);
+    pub(crate) struct FakeView(pub(crate) Log);
     impl ExplainView for FakeView {
         fn show_loading(&self, t: &str) {
             push(&self.0, format!("loading:{t}"));
@@ -501,6 +608,38 @@ mod tests {
         }
         fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode) {
             push(&self.0, format!("correction:{}:{mode:?}", sentences.len()));
+        }
+        fn show_table(&self, table: SheetsTable) {
+            push(&self.0, format!("table:{}x{}", table.rows, table.cols));
+        }
+    }
+
+    /// Routing that always answers "not Sheets" and a range port that is never reached.
+    pub(crate) struct NoSheets;
+
+    impl SheetsRouting for NoSheets {
+        fn url_and_state(&self) -> (Option<String>, Option<ct_sheets::SheetsInputState>) {
+            (None, None)
+        }
+    }
+
+    impl SheetsInteraction for NoSheets {
+        fn capture_selection(&self) -> Result<ct_sheets::SheetSelection, ct_sheets::CaptureError> {
+            panic!("range port used off Sheets")
+        }
+        fn can_edit(&self) -> bool {
+            false
+        }
+        fn write_selection(&self, _: &ct_sheets::SheetSelection, _: &str) -> Result<(), String> {
+            panic!("range port used off Sheets")
+        }
+    }
+
+    fn no_sheets(config: &SheetsConfig) -> SheetsDeps<'_> {
+        SheetsDeps {
+            routing: &NoSheets,
+            range: &NoSheets,
+            config,
         }
     }
 
@@ -542,7 +681,7 @@ mod tests {
             let log: Log = Default::default();
             let mut ti = FakeTi::new(self.text, &log);
             if self.replace_fails {
-                ti.replace_result = Err(ReplaceError::ContextChanged);
+                ti.replace_err = Some(|| ReplaceError::ContextChanged);
             }
             let llm = FakeLlm(self.mode);
             let d = FlowDeps {
@@ -552,10 +691,12 @@ mod tests {
                 llm: &llm,
             };
             let docs = self.docs;
+            let cfg = SheetsConfig::default();
             alt_alt_flow(
                 &d,
+                &no_sheets(&cfg),
                 &ti,
-                &move || docs,
+                &move || docs.then_some(MSG_ALT_NO_SELECTION_DOCS),
                 &FakeBadge(log.clone()),
                 &FakeNotifier(log.clone()),
             );
@@ -578,7 +719,8 @@ mod tests {
             detector: &RuleBasedDetector,
             llm: &llm,
         };
-        ctrl_ctrl_flow(&d, &ti, &FakeView(log.clone()));
+        let cfg = SheetsConfig::default();
+        ctrl_ctrl_flow(&d, &no_sheets(&cfg), &ti, &FakeView(log.clone()));
         snapshot(&log)
     }
 
@@ -833,7 +975,7 @@ mod tests {
         let log: Log = Default::default();
         let mut ti = FakeTi::new(text, &log);
         if replace_fails {
-            ti.replace_result = Err(ReplaceError::ContextChanged);
+            ti.replace_err = Some(|| ReplaceError::ContextChanged);
         }
         let d = FlowDeps {
             settings: s,
@@ -841,8 +983,10 @@ mod tests {
             detector: &RuleBasedDetector,
             llm,
         };
+        let cfg = SheetsConfig::default();
         correction_replace_flow(
             &d,
+            &no_sheets(&cfg),
             &ti,
             released,
             &FakeBadge(log.clone()),
@@ -865,7 +1009,8 @@ mod tests {
             detector: &RuleBasedDetector,
             llm,
         };
-        correction_view_flow(&d, &ti, released, &FakeView(log.clone()));
+        let cfg = SheetsConfig::default();
+        correction_view_flow(&d, &no_sheets(&cfg), &ti, released, &FakeView(log.clone()));
         snapshot(&log)
     }
 
@@ -952,8 +1097,10 @@ mod tests {
             detector: &RuleBasedDetector,
             llm: &llm,
         };
+        let cfg = SheetsConfig::default();
         correction_replace_flow(
             &d,
+            &no_sheets(&cfg),
             &ti,
             &released,
             &FakeBadge(log.clone()),

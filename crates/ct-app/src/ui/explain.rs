@@ -416,6 +416,11 @@ impl ExplainView for ExplainWindow {
     fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode) {
         self.dispatch(build_correction_view_state(&sentences, mode), Present::Fit);
     }
+
+    /// Temporary: the table view is drawn by a later task.
+    fn show_table(&self, _table: ct_sheets::SheetsTable) {
+        tracing::warn!("sheets table view not implemented yet");
+    }
 }
 
 impl Notifier for ExplainWindow {

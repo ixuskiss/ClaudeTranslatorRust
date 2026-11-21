@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 ct-core = { path = "../ct-core" }
 ct-llm = { path = "../ct-llm" }
+ct-sheets = { path = "../ct-sheets" }
 ct-win = { path = "../ct-win" }
 tracing.workspace = true
 crossbeam-channel.workspace = true

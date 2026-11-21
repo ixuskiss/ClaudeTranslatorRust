@@ -964,6 +964,7 @@ dependencies = [
  "crossbeam-channel",
  "ct-core",
  "ct-llm",
+ "ct-sheets",
  "ct-win",
  "raw-window-handle",
  "slint",

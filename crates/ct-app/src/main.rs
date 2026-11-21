@@ -15,14 +15,16 @@ use std::time::Duration;
 
 use ct_app::dispatch::{AppState, Dispatcher, GestureAction, Snapshot};
 use ct_app::flows::{
-    Badge, ExplainView, FlowDeps, MSG_CLI_UNAVAILABLE, MSG_CORRECTION_FAILED, MSG_EXPLAIN_FAILED,
-    MSG_TRANSLATE_FAILED, Notifier, alt_alt_flow, correction_replace_flow, correction_view_flow,
-    ctrl_ctrl_flow,
+    Badge, ExplainView, FlowDeps, MSG_ALT_NO_SELECTION_DOCS, MSG_CLI_UNAVAILABLE,
+    MSG_CORRECTION_FAILED, MSG_EXPLAIN_FAILED, MSG_TRANSLATE_FAILED, Notifier, alt_alt_flow,
+    correction_replace_flow, correction_view_flow, ctrl_ctrl_flow,
 };
 use ct_app::logging;
+use ct_app::sheets_flows::SheetsDeps;
 use ct_app::ui::tray::{Tray, TrayCommand};
 use ct_app::ui::win32::{message_box, message_box_blocking};
 use ct_app::ui::{BadgeWindow, DictionaryWindow, ExplainWindow, SettingsWindow};
+use ct_core::SheetsConfig;
 use ct_core::{
     AppConfig, Lang, LanguageDetector, PersonalDictionaryStore, RuleBasedDetector, SettingsStore,
     UserSettings, file_problems_warning, load_app_config_from_environment, normalize_targets,
@@ -32,6 +34,7 @@ use ct_llm::{
     BuiltProvider, CatalogSource, ClaudeCliClient, ModelCatalog, ProviderOverrides, RealSpawner,
     RefreshOutcome, build_llm_provider, home_dir, refresh_catalog_and_warm_up,
 };
+use ct_sheets::{CaptureError, SheetSelection, SheetsInputState, SheetsInteraction, SheetsRouting};
 use ct_win::chrome::{
     ChromeAdapter, READ_ONLY_STRATEGIES, REPLACE_STRATEGIES, RetryingInteraction, TextInteraction,
     UiaBackend, WindowsUiaBackend,
@@ -109,6 +112,32 @@ struct AppAction {
     badge: Arc<dyn Badge>,
     notifier: Arc<dyn Notifier>,
     view: Arc<dyn ExplainView>,
+    sheets_routing: Box<dyn SheetsRouting>,
+    sheets_range: Box<dyn SheetsInteraction>,
+    sheets_config: SheetsConfig,
+}
+
+/// Placeholder Sheets ports until the Windows Sheets backend is wired in: routing always
+/// answers "not Sheets", so every gesture takes the text flow and the range port is never
+/// reached.
+struct NoSheetsBackend;
+
+impl SheetsRouting for NoSheetsBackend {
+    fn url_and_state(&self) -> (Option<String>, Option<SheetsInputState>) {
+        (None, None)
+    }
+}
+
+impl SheetsInteraction for NoSheetsBackend {
+    fn capture_selection(&self) -> Result<SheetSelection, CaptureError> {
+        Err(CaptureError { reason: None })
+    }
+    fn can_edit(&self) -> bool {
+        false
+    }
+    fn write_selection(&self, _: &SheetSelection, _: &str) -> Result<(), String> {
+        Err("sheets backend not available".into())
+    }
 }
 
 impl GestureAction for AppAction {
@@ -119,17 +148,26 @@ impl GestureAction for AppAction {
             detector: self.detector.as_ref(),
             llm: snapshot.llm.as_ref(),
         };
+        let sheets = SheetsDeps {
+            routing: self.sheets_routing.as_ref(),
+            range: self.sheets_range.as_ref(),
+            config: &self.sheets_config,
+        };
         match gesture {
             Gesture::AltAlt => alt_alt_flow(
                 &deps,
+                &sheets,
                 self.replace.as_ref(),
-                self.docs_or_slides.as_ref(),
+                &|| (self.docs_or_slides)().then_some(MSG_ALT_NO_SELECTION_DOCS),
                 self.badge.as_ref(),
                 self.notifier.as_ref(),
             ),
-            Gesture::CtrlCtrl => ctrl_ctrl_flow(&deps, self.view_only.as_ref(), self.view.as_ref()),
+            Gesture::CtrlCtrl => {
+                ctrl_ctrl_flow(&deps, &sheets, self.view_only.as_ref(), self.view.as_ref())
+            }
             Gesture::CtrlHeldAltAlt => correction_replace_flow(
                 &deps,
+                &sheets,
                 self.replace.as_ref(),
                 self.modifiers_released.as_ref(),
                 self.badge.as_ref(),
@@ -137,6 +175,7 @@ impl GestureAction for AppAction {
             ),
             Gesture::AltHeldCtrlCtrl => correction_view_flow(
                 &deps,
+                &sheets,
                 self.view_only.as_ref(),
                 self.modifiers_released.as_ref(),
                 self.view.as_ref(),
@@ -506,6 +545,9 @@ fn main() {
         badge,
         notifier: explain.clone(),
         view: explain,
+        sheets_routing: Box::new(NoSheetsBackend),
+        sheets_range: Box::new(NoSheetsBackend),
+        sheets_config: config.sheets.clone(),
     };
     let dispatcher = Dispatcher::new(Arc::clone(&state), Arc::new(action));
 
@@ -647,6 +689,9 @@ mod tests {
         ) {
             push(&self.0, "view.correction");
         }
+        fn show_table(&self, _table: ct_sheets::SheetsTable) {
+            push(&self.0, "view.table");
+        }
     }
 
     struct NoCapture(Log);
@@ -673,6 +718,9 @@ mod tests {
             badge: recorder.clone(),
             notifier: recorder.clone(),
             view: recorder,
+            sheets_routing: Box::new(NoSheetsBackend),
+            sheets_range: Box::new(NoSheetsBackend),
+            sheets_config: SheetsConfig::default(),
         }
     }
 
