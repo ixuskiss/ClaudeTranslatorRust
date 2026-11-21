@@ -1,6 +1,7 @@
 //! Test helpers shared across ct-core unit tests.
 
 use crate::llm::{
+    BatchCorrectionRequest, BatchCorrectionResult, BatchTranslationRequest, BatchTranslationResult,
     CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult, LlmError,
     LlmProvider, TranslationRequest, TranslationResult,
 };
@@ -16,7 +17,14 @@ pub(crate) struct FakeLlm {
     explain: Mutex<Script<ExplanationRequest, ExplanationResult>>,
     correct: Mutex<Script<CorrectionRequest, String>>,
     correct_sentences: Mutex<Script<CorrectionRequest, Vec<CorrectionSentence>>>,
+    translate_batch: Mutex<Script<BatchTranslationRequest, BatchTranslationResult>>,
+    correct_batch: Mutex<Script<BatchCorrectionRequest, BatchCorrectionResult>>,
+    batch_responder: Mutex<Option<BatchResponder>>,
 }
+
+/// Computes a batch translation reply from the request when no scripted reply is queued.
+pub(crate) type BatchResponder =
+    Box<dyn Fn(&BatchTranslationRequest) -> Result<BatchTranslationResult, LlmError> + Send + Sync>;
 
 struct Script<Req, Res> {
     responses: VecDeque<Result<Res, LlmError>>,
@@ -97,6 +105,49 @@ impl FakeLlm {
         correct_sentences_requests,
         correct_sentences_calls
     );
+    accessors!(
+        translate_batch,
+        BatchTranslationRequest,
+        BatchTranslationResult,
+        push_translate_batch,
+        translate_batch_requests,
+        translate_batch_calls
+    );
+    accessors!(
+        correct_batch,
+        BatchCorrectionRequest,
+        BatchCorrectionResult,
+        push_correct_batch,
+        correct_batch_requests,
+        correct_batch_calls
+    );
+
+    /// Replies to every unscripted `translate_batch` call by computing from the request.
+    pub(crate) fn set_batch_responder(&self, r: BatchResponder) -> &Self {
+        *lock(&self.batch_responder) = Some(r);
+        self
+    }
+
+    /// Responder that answers each item with `"[<lang>] <text>"` per destination.
+    pub(crate) fn echo_batch_responder() -> BatchResponder {
+        Box::new(|req| {
+            Ok(BatchTranslationResult {
+                items: req
+                    .items
+                    .iter()
+                    .map(|i| {
+                        (
+                            i.id.clone(),
+                            i.destinations
+                                .iter()
+                                .map(|l| (*l, format!("[{}] {}", l.code(), i.text)))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+    }
 }
 
 impl LlmProvider for FakeLlm {
@@ -114,6 +165,29 @@ impl LlmProvider for FakeLlm {
         req: &CorrectionRequest,
     ) -> Result<Vec<CorrectionSentence>, LlmError> {
         call(&self.correct_sentences, req)
+    }
+    fn translate_batch(
+        &self,
+        req: &BatchTranslationRequest,
+    ) -> Result<BatchTranslationResult, LlmError> {
+        let queued = {
+            let mut s = lock(&self.translate_batch);
+            s.requests.push(req.clone());
+            s.responses.pop_front()
+        };
+        if let Some(r) = queued {
+            return r;
+        }
+        match lock(&self.batch_responder).as_ref() {
+            Some(f) => f(req),
+            None => Err(LlmError("FakeLlm: no response queued".into())),
+        }
+    }
+    fn correct_batch(
+        &self,
+        req: &BatchCorrectionRequest,
+    ) -> Result<BatchCorrectionResult, LlmError> {
+        call(&self.correct_batch, req)
     }
 }
 

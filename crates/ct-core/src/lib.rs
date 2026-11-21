@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod atomic_write;
+pub mod batch;
 pub mod compose;
 pub mod config;
 pub mod correction;
@@ -23,6 +24,9 @@ pub use settings::{
     toggle_target, with_base,
 };
 
+pub use batch::{
+    BatchFailure, BatchLimits, CellKey, CellText, compose_cell_replacements, translate_cells,
+};
 pub use compose::compose_replacement;
 pub use config::{
     AppConfig, ClaudeCliConfig, LlmProviderKind, SheetsConfig, load_app_config,
@@ -37,9 +41,10 @@ pub use dictionary::{
 pub use explain::{explain_text, restore_sentence_columns};
 pub use file_problems::file_problems_warning;
 pub use llm::{
-    CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult,
-    ExplanationSentence, LlmError, LlmProvider, TranslationRequest, TranslationResult,
-    parse_json_response, parse_language_map,
+    BatchCorrectionItem, BatchCorrectionRequest, BatchCorrectionResult, BatchItem,
+    BatchTranslationRequest, BatchTranslationResult, CorrectionRequest, CorrectionSentence,
+    ExplanationRequest, ExplanationResult, ExplanationSentence, LlmError, LlmProvider,
+    TranslationRequest, TranslationResult, parse_json_response, parse_language_map,
 };
 pub use paths::user_data_dir;
 pub use plan::{TranslationPlan, resolve_plan};

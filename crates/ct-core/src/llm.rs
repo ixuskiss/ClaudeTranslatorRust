@@ -43,6 +43,44 @@ pub struct CorrectionSentence {
     pub corrected: String,
 }
 
+/// One cell of a batch translation. `text` is already dictionary-masked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchItem {
+    pub id: String,
+    pub text: String,
+    pub source: Lang,
+    pub destinations: Vec<Lang>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchTranslationRequest {
+    pub items: Vec<BatchItem>,
+    pub tone: Tone,
+}
+
+/// Per item id, the translations for that item's `destinations`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchTranslationResult {
+    pub items: Vec<(String, Vec<(Lang, String)>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCorrectionItem {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCorrectionRequest {
+    pub items: Vec<BatchCorrectionItem>,
+    pub mode: CorrectionMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCorrectionResult {
+    pub items: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 #[error("{0}")]
 pub struct LlmError(pub String);
@@ -56,6 +94,22 @@ pub trait LlmProvider: Send + Sync {
         &self,
         req: &CorrectionRequest,
     ) -> Result<Vec<CorrectionSentence>, LlmError>;
+
+    fn translate_batch(
+        &self,
+        _req: &BatchTranslationRequest,
+    ) -> Result<BatchTranslationResult, LlmError> {
+        Err(LlmError(
+            "batch translation not supported by this provider".into(),
+        ))
+    }
+
+    fn correct_batch(
+        &self,
+        _req: &BatchCorrectionRequest,
+    ) -> Result<BatchCorrectionResult, LlmError> {
+        Err(LlmError("correction not supported by this provider".into()))
+    }
 }
 
 const MALFORMED: &str = "Claude CLI returned a malformed JSON response";
