@@ -61,3 +61,8 @@ pub struct SheetSelection {
     /// `None` = could not be determined; never treated as "not hidden".
     pub hidden_or_filtered: Option<bool>,
 }
+
+/// Parse/decode failure carrying only a fixed phrase (never clipboard content).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct SheetsParseError(pub &'static str);
