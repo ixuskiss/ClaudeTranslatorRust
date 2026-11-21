@@ -602,3 +602,23 @@ fn confirm_copy_key_failure_is_unconfirmed_ok_without_restore() {
     assert_eq!(f.restores(), 0);
     assert_eq!(f.read_registered(HTML_FORMAT).unwrap(), cf.as_bytes());
 }
+
+#[test]
+fn paste_confirm_window_is_one_second() {
+    assert_eq!(PASTE_CONFIRM_TIMEOUT, Duration::from_millis(1000));
+}
+
+#[test]
+fn clear_marquee_sends_only_esc_and_touches_no_clipboard() {
+    let f = Fake::new(None, true);
+    clear_marquee_with(&f);
+    assert_eq!(f.sent(), vec![Chord::Esc]);
+    assert!(f.writes.lock().unwrap().is_empty());
+    assert_eq!(f.restores(), 0);
+
+    // A failed Esc is logged and ignored.
+    let mut f = Fake::new(None, true);
+    f.fail_on = Some(Chord::Esc);
+    clear_marquee_with(&f);
+    assert_eq!(f.sent(), vec![Chord::Esc]);
+}

@@ -2,7 +2,7 @@
 //! Logs carry statuses, counts and durations only, never cell text.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ct_core::{BatchFailure, CellText, Lang};
 
@@ -29,7 +29,25 @@ pub trait SheetsInteraction: Send + Sync {
     }
     fn can_edit(&self) -> bool;
     fn write_selection(&self, selection: &SheetSelection, cf_html: &str) -> Result<(), String>;
+    /// The Name Box address read without sending keys; `None` = unknown.
+    fn current_address(&self) -> Option<String> {
+        None
+    }
+    /// Sends Esc to clear Sheets' copy marquee (grid selection mode only).
+    fn clear_copy_marquee(&self) {}
+    /// Pause between verify attempts (injectable so tests don't sleep).
+    fn wait(&self, d: Duration) {
+        std::thread::sleep(d)
+    }
 }
+
+/// Delays before each post-write verify attempt: Sheets can take seconds to apply a paste.
+pub const VERIFY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(300),
+    Duration::from_millis(700),
+    Duration::from_millis(1000),
+    Duration::from_millis(1500),
+];
 
 /// Result columns of one cell: `(language, text)` per requested column.
 pub type TableResults = Vec<(Option<Lang>, String)>;
@@ -146,18 +164,46 @@ fn replace_cells_inner(
     {
         return outcome(SheetsStatus::WriteFailed);
     }
-    // 9. verify
-    match ia.reread_selection() {
-        Ok(after) if written_as_expected(&selection.grid, &translations, &after.grid) => {}
-        _ => return outcome(SheetsStatus::WriteUnverified),
+    // 9. verify (retried with delays; the write itself is never repeated)
+    verify_written(ia, &selection, &translations)
+}
+
+/// Step 9-10: reread until the write shows up. If the user has moved to another
+/// cell, stop without a reread (a Ctrl+C there would copy their cell) and report
+/// success: the single paste was delivered, the left range cannot be verified.
+fn verify_written(
+    ia: &dyn SheetsInteraction,
+    selection: &SheetSelection,
+    translations: &[(CellKey, String)],
+) -> SheetsOutcome {
+    let target = selection.location.range_address.as_deref();
+    let moved = || {
+        tracing::info!("verification skipped: selection moved");
+        outcome(SheetsStatus::Success)
+    };
+    for (attempt, delay) in VERIFY_DELAYS.iter().enumerate() {
+        ia.wait(*delay);
+        if let Some(address) = ia.current_address()
+            && Some(address.as_str()) != target
+        {
+            return moved();
+        }
+        match ia.reread_selection() {
+            Ok(after) if after.location.range_address.as_deref() != target => return moved(),
+            Ok(after) if written_as_expected(&selection.grid, translations, &after.grid) => {
+                ia.clear_copy_marquee();
+                tracing::info!(
+                    cells = selection.grid.cells.len(),
+                    translated = translations.len(),
+                    attempt = attempt + 1,
+                    "sheets replace verified"
+                );
+                return outcome(SheetsStatus::Success);
+            }
+            _ => {}
+        }
     }
-    // 10.
-    tracing::info!(
-        cells = selection.grid.cells.len(),
-        translated = translations.len(),
-        "sheets replace verified"
-    );
-    outcome(SheetsStatus::Success)
+    outcome(SheetsStatus::WriteUnverified)
 }
 
 /// Capture for the table view: no `can_edit` check; links and rich text allowed.
@@ -265,6 +311,10 @@ mod tests {
         write_error: Option<String>,
         writes: Mutex<Vec<String>>,
         reread_calls: Mutex<usize>,
+        /// Name Box addresses returned by `current_address`, in order (None when empty).
+        addresses: Mutex<VecDeque<Option<String>>>,
+        waits: Mutex<Vec<Duration>>,
+        marquee_clears: Mutex<usize>,
     }
 
     impl Fake {
@@ -276,7 +326,21 @@ mod tests {
                 write_error: None,
                 writes: Mutex::new(Vec::new()),
                 reread_calls: Mutex::new(0),
+                addresses: Mutex::new(VecDeque::new()),
+                waits: Mutex::new(Vec::new()),
+                marquee_clears: Mutex::new(0),
             }
+        }
+        fn with_addresses(self, addresses: Vec<Option<&str>>) -> Self {
+            *self.addresses.lock().unwrap() =
+                addresses.into_iter().map(|a| a.map(String::from)).collect();
+            self
+        }
+        fn marquee_clears(&self) -> usize {
+            *self.marquee_clears.lock().unwrap()
+        }
+        fn waits(&self) -> Vec<Duration> {
+            self.waits.lock().unwrap().clone()
         }
         fn writes(&self) -> usize {
             self.writes.lock().unwrap().len()
@@ -307,6 +371,15 @@ mod tests {
             }
             self.writes.lock().unwrap().push(cf_html.to_string());
             Ok(())
+        }
+        fn current_address(&self) -> Option<String> {
+            self.addresses.lock().unwrap().pop_front().flatten()
+        }
+        fn clear_copy_marquee(&self) {
+            *self.marquee_clears.lock().unwrap() += 1;
+        }
+        fn wait(&self, d: Duration) {
+            self.waits.lock().unwrap().push(d);
         }
     }
 
@@ -363,6 +436,8 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].key, (0, 0));
         assert_eq!(fake.writes(), 1);
+        assert_eq!(fake.rereads_done(), 2);
+        assert_eq!(fake.marquee_clears(), 1);
         let frag = extract_cf_html_fragment(&fake.writes.lock().unwrap()[0]).unwrap();
         assert!(frag.contains("[en] 안녕하세요") && frag.contains("[en] 합계"));
     }
@@ -488,17 +563,76 @@ mod tests {
     #[test]
     fn verify_mismatch_is_write_unverified() {
         let sel = selection("A1:C2");
-        // Sheet ignored the paste: the after-read equals the original.
-        let f = Fake::new(Ok(sel.clone()), vec![Ok(sel.clone()), Ok(sel.clone())]);
+        // Sheet ignored the paste: every after-read equals the original.
+        let f = Fake::new(
+            Ok(sel.clone()),
+            vec![
+                Ok(sel.clone()),
+                Ok(sel.clone()),
+                Ok(sel.clone()),
+                Ok(sel.clone()),
+                Ok(sel.clone()),
+            ],
+        );
         let mut t = ok_transform;
         assert_eq!(run(&f, false, &mut t).status, SheetsStatus::WriteUnverified);
         assert_eq!(f.writes(), 1);
+        // 1 target check + 4 verify attempts, one wait before each attempt.
+        assert_eq!(f.rereads_done(), 5);
+        assert_eq!(f.waits(), VERIFY_DELAYS.to_vec());
+        assert_eq!(f.marquee_clears(), 0);
 
         let f = Fake::new(
             Ok(sel.clone()),
             vec![Ok(sel), Err(CaptureError { reason: None })],
         );
         assert_eq!(run(&f, false, &mut t).status, SheetsStatus::WriteUnverified);
+        assert_eq!(f.writes(), 1);
+        assert_eq!(f.rereads_done(), 5);
+    }
+
+    #[test]
+    fn verify_moved_before_first_reread_succeeds_without_reread() {
+        let sel = selection("A1:C2");
+        let f = Fake::new(Ok(sel.clone()), vec![Ok(sel.clone())]).with_addresses(vec![Some("D5")]);
+        let mut t = ok_transform;
+        assert_eq!(run(&f, false, &mut t).status, SheetsStatus::Success);
+        assert_eq!(f.writes(), 1);
+        // Only the pre-write target check; no Ctrl+C on the moved-to cell.
+        assert_eq!(f.rereads_done(), 1);
+        assert_eq!(f.marquee_clears(), 0);
+        assert_eq!(f.waits(), vec![VERIFY_DELAYS[0]]);
+    }
+
+    #[test]
+    fn verify_mismatch_then_match_succeeds_and_clears_marquee_once() {
+        let sel = selection("A1:C2");
+        let f = Fake::new(
+            Ok(sel.clone()),
+            vec![
+                Ok(sel.clone()),
+                Ok(sel.clone()),
+                Ok(after_write(&sel, &expected())),
+            ],
+        )
+        .with_addresses(vec![Some("A1:C2"), None]);
+        let mut t = ok_transform;
+        assert_eq!(run(&f, false, &mut t).status, SheetsStatus::Success);
+        assert_eq!(f.writes(), 1);
+        assert_eq!(f.rereads_done(), 3);
+        assert_eq!(f.marquee_clears(), 1);
+        assert_eq!(f.waits(), VERIFY_DELAYS[..2].to_vec());
+    }
+
+    #[test]
+    fn verify_reread_at_other_address_succeeds_without_marquee_clear() {
+        let sel = selection("A1:C2");
+        let f = Fake::new(Ok(sel.clone()), vec![Ok(sel.clone()), Ok(selection("D5"))]);
+        let mut t = ok_transform;
+        assert_eq!(run(&f, false, &mut t).status, SheetsStatus::Success);
+        assert_eq!(f.writes(), 1);
+        assert_eq!(f.rereads_done(), 2);
+        assert_eq!(f.marquee_clears(), 0);
     }
 
     #[test]

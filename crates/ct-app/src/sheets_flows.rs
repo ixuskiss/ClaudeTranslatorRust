@@ -20,8 +20,8 @@ use ct_sheets::{
 use ct_win::chrome::ReplaceError;
 
 use crate::flows::{
-    Badge, BadgeGuard, ExplainView, FlowDeps, LOADING_TEXT, MSG_CLI_UNAVAILABLE, Notifier,
-    is_cli_start_failure,
+    Badge, BadgeGuard, ExplainView, FlowDeps, LOADING_TEXT, MSG_CLI_UNAVAILABLE,
+    MSG_DIRECTION_UNKNOWN, Notifier, is_cli_start_failure,
 };
 
 pub const MSG_SHEETS_EDIT_TRANSLATE_FAILED: &str =
@@ -124,37 +124,62 @@ pub(crate) fn run_range_replace(
     notifier: &dyn Notifier,
 ) {
     badge.show(badge_text);
-    let cli_down = Cell::new(false);
+    let notice = Cell::new(None);
     let outcome = {
         let _guard = BadgeGuard(badge);
         match job {
-            Job::Translate => translate_range(d, s, started, &cli_down),
-            Job::Correct => correct_range(d, s, started, &cli_down),
+            Job::Translate => translate_range(d, s, started, &notice),
+            Job::Correct => correct_range(d, s, started, &notice),
         }
     };
-    // The flag only counts when the job actually ended in the transform's failure status.
-    let cli_down = cli_down.get()
-        && matches!(
+    // The notice only counts when the job actually ended in the transform's failure status.
+    let notice = notice.get().filter(|_| {
+        matches!(
             outcome.status,
             SheetsStatus::TranslationFailed | SheetsStatus::CorrectionFailed
-        );
+        )
+    });
     tracing::info!(
         operation = job_operation(job, false),
         status = ?outcome.status,
-        cli_down,
+        notice = ?notice,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "done"
     );
-    if cli_down {
-        notifier.notify(MSG_CLI_UNAVAILABLE);
+    if let Some(notice) = notice {
+        notifier.notify(notice.message());
     } else if outcome.status != SheetsStatus::Success {
         notifier.notify(&outcome.user_message());
     }
 }
 
-/// True when a batch failed because the Claude CLI could not be started (plan 3 D2).
-fn is_cli_down(f: &BatchFailure) -> bool {
-    matches!(f, BatchFailure::Llm(m) if is_cli_start_failure(m))
+/// A batch failure that has its own message instead of the generic failure text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureNotice {
+    /// The Claude CLI could not be started (plan 3 D2).
+    CliDown,
+    /// No safe translation direction (same message as the text flow).
+    DirectionUnknown,
+}
+
+impl FailureNotice {
+    fn message(self) -> &'static str {
+        match self {
+            FailureNotice::CliDown => MSG_CLI_UNAVAILABLE,
+            FailureNotice::DirectionUnknown => MSG_DIRECTION_UNKNOWN,
+        }
+    }
+}
+
+/// A table job failure: the outcome and its special notice, if any.
+type TableFailure = (SheetsOutcome, Option<FailureNotice>);
+
+fn failure_notice(f: &BatchFailure) -> Option<FailureNotice> {
+    match f {
+        BatchFailure::Llm(m) if is_cli_start_failure(m) => Some(FailureNotice::CliDown),
+        BatchFailure::DirectionUnknown => Some(FailureNotice::DirectionUnknown),
+        _ => None,
+    }
 }
 
 fn job_operation(job: Job, view: bool) -> &'static str {
@@ -170,7 +195,7 @@ fn translate_range(
     d: &FlowDeps,
     s: &SheetsDeps,
     started: Instant,
-    cli_down: &Cell<bool>,
+    notice: &Cell<Option<FailureNotice>>,
 ) -> SheetsOutcome {
     let st = d.settings;
     let limits = BatchLimits::from(s.config);
@@ -190,7 +215,7 @@ fn translate_range(
             &elapsed,
         )
         .map_err(|f| {
-            cli_down.set(is_cli_down(&f));
+            notice.set(failure_notice(&f));
             translation_failure(&f)
         })?;
         compose_cell_replacements(cells, &translated, include, limits.max_cell_chars)
@@ -210,7 +235,7 @@ fn correct_range(
     d: &FlowDeps,
     s: &SheetsDeps,
     started: Instant,
-    cli_down: &Cell<bool>,
+    notice: &Cell<Option<FailureNotice>>,
 ) -> SheetsOutcome {
     let limits = BatchLimits::from(s.config);
     let elapsed = || started.elapsed();
@@ -225,7 +250,7 @@ fn correct_range(
             &elapsed,
         )
         .map_err(|f| {
-            cli_down.set(is_cli_down(&f));
+            notice.set(failure_notice(&f));
             correction_failure(&f)
         })
     };
@@ -269,13 +294,13 @@ pub(crate) fn run_table(
     let limits = BatchLimits::from(s.config);
     let elapsed = || started.elapsed();
     let st = d.settings;
-    let results: Result<Vec<(CellKey, TableResults)>, (SheetsOutcome, bool)> = match job {
+    let results: Result<Vec<(CellKey, TableResults)>, TableFailure> = match job {
         Job::Translate if cells.is_empty() => Err((
             SheetsOutcome {
                 status: SheetsStatus::NoText,
                 reason: None,
             },
-            false,
+            None,
         )),
         Job::Translate => translate_cells(
             &cells,
@@ -297,7 +322,7 @@ pub(crate) fn run_table(
                 })
                 .collect()
         })
-        .map_err(|f| (translation_failure(&f), is_cli_down(&f))),
+        .map_err(|f| (translation_failure(&f), failure_notice(&f))),
         Job::Correct => correct_cells(
             &cells,
             d.entries,
@@ -312,7 +337,7 @@ pub(crate) fn run_table(
                 .map(|(key, text)| (key, vec![(None, text)]))
                 .collect()
         })
-        .map_err(|f| (correction_failure(&f), is_cli_down(&f))),
+        .map_err(|f| (correction_failure(&f), failure_notice(&f))),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match results {
@@ -326,19 +351,18 @@ pub(crate) fn run_table(
             );
             view.show_table(table_from(&selection, &results));
         }
-        Err((outcome, cli_down)) => {
+        Err((outcome, notice)) => {
             tracing::info!(
                 operation,
                 status = ?outcome.status,
-                cli_down,
+                notice = ?notice,
                 cells = cells.len(),
                 elapsed_ms,
                 "done"
             );
-            if cli_down {
-                view.show_error(MSG_CLI_UNAVAILABLE);
-            } else {
-                view.show_error(&outcome.user_message());
+            match notice {
+                Some(notice) => view.show_error(notice.message()),
+                None => view.show_error(&outcome.user_message()),
             }
         }
     }
@@ -349,8 +373,9 @@ mod tests {
     use super::*;
     use crate::flows::tests::{FakeBadge, FakeNotifier, FakeTi, Log, push, snapshot};
     use crate::flows::{
-        ExplainView, FlowDeps, MSG_CORRECTION_REPLACE_NO_SELECTION, MSG_REPLACE_FAILED,
-        alt_alt_flow, correction_replace_flow, correction_view_flow, ctrl_ctrl_flow,
+        ExplainView, FlowDeps, MSG_CORRECTION_REPLACE_NO_SELECTION, MSG_DIRECTION_UNKNOWN,
+        MSG_REPLACE_FAILED, alt_alt_flow, correction_replace_flow, correction_view_flow,
+        ctrl_ctrl_flow,
     };
     use ct_core::llm::{
         BatchCorrectionRequest, BatchCorrectionResult, BatchTranslationRequest,
@@ -501,6 +526,7 @@ mod tests {
             *self.written.lock().unwrap() = Some(cf_html.to_string());
             Ok(())
         }
+        fn wait(&self, _: std::time::Duration) {}
     }
 
     /// Like the flows' FakeView, and keeps the last table for content checks.
@@ -910,6 +936,34 @@ mod tests {
         let r = cli_down_case(&[&["안녕 하세요"]]).run(G::CorrectionView);
         assert_eq!(r.table, None);
         assert_eq!(r.log.last(), Some(&format!("error:{MSG_CLI_UNAVAILABLE}")));
+    }
+
+    /// No usable direction: the only target is the base language (like a cell whose
+    /// languages leave nothing to translate into).
+    fn direction_unknown_case(rows: &[&[&str]]) -> Case {
+        let mut case = Case::range(rows);
+        case.settings.target_languages = vec![Lang::Ko];
+        case
+    }
+
+    #[test]
+    fn range_translate_direction_unknown_shows_direction_message() {
+        let r = direction_unknown_case(&[&["안녕"]]).run(G::AltAlt);
+        assert_eq!(r.written, None);
+        assert_eq!(
+            r.log[r.log.len() - 2..],
+            ["hide".to_string(), notify(MSG_DIRECTION_UNKNOWN)]
+        );
+    }
+
+    #[test]
+    fn table_translate_direction_unknown_shows_direction_message() {
+        let r = direction_unknown_case(&[&["안녕"]]).run(G::CtrlCtrl);
+        assert_eq!(r.table, None);
+        assert_eq!(
+            r.log.last(),
+            Some(&format!("error:{MSG_DIRECTION_UNKNOWN}"))
+        );
     }
 
     #[test]

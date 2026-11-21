@@ -24,7 +24,9 @@ const HTML_FORMAT: &str = "HTML Format";
 /// Ctrl+C 뒤 범위 복사가 클립보드를 바꿀 때까지 기다리는 최대 시간(S-ref §2.3).
 pub const RANGE_COPY_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Ctrl+V, Ctrl+C 뒤 붙여넣기 확인을 기다리는 최대 시간(S-ref §4.3).
-pub const PASTE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Sheets는 붙여넣기 적용에 몇 초가 걸릴 수 있어 이 창 안에 확인되지 않는 일이 흔하다.
+/// 짧게 두고, 실제 결과 확인은 서비스의 지연 재확인(`VERIFY_DELAYS`)이 맡는다.
+pub const PASTE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1000);
 /// 이름 상자 검색 깊이(S-ref §2.2).
 pub const NAME_BOX_SEARCH_DEPTH: u32 = 24;
 const NAME_BOX_AUTOMATION_ID: &str = "t-name-box";
@@ -324,6 +326,15 @@ pub(crate) fn write_with(
     Ok(())
 }
 
+/// 검증 복사가 남긴 복사 표시(점선 테두리)를 Esc로 지운다. 클립보드는 건드리지 않는다.
+/// Alt가 눌린 채 Esc를 보내면 창 전환이 되므로 먼저 Alt 해제를 기다린다.
+pub(crate) fn clear_marquee_with(keys: &dyn KeySender) {
+    wait_until_alt_released(keys, ALT_RELEASE_TIMEOUT);
+    if let Err(e) = keys.send(Chord::Esc) {
+        tracing::debug!(error = %e, "sheets copy marquee clear key failed");
+    }
+}
+
 /// 실제 UIA 조회. 호출마다 포그라운드 창을 다시 잡는다(UIA 객체는 스레드를 넘기지 않는다).
 struct UiaProbe<'a> {
     keys: &'a dyn KeySender,
@@ -447,6 +458,17 @@ impl SheetsInteraction for WindowsSheetsBackend {
             cf_html,
             TIMEOUTS,
         )
+    }
+
+    /// 키도 클립보드도 쓰지 않으므로 잠금을 잡지 않는다.
+    fn current_address(&self) -> Option<String> {
+        self.probe().range_address()
+    }
+
+    /// 다른 작업의 복사·붙여넣기 키 사이에 끼지 않도록 이 파일의 다른 키처럼 구간 잠금 안에서 보낸다.
+    fn clear_copy_marquee(&self) {
+        let _section = lock_clipboard_section();
+        clear_marquee_with(self.keys.as_ref());
     }
 }
 

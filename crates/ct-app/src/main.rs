@@ -148,6 +148,15 @@ impl<B: SheetsInteraction> SheetsInteraction for Shared<B> {
     fn write_selection(&self, selection: &SheetSelection, text: &str) -> Result<(), String> {
         self.0.write_selection(selection, text)
     }
+    fn current_address(&self) -> Option<String> {
+        self.0.current_address()
+    }
+    fn clear_copy_marquee(&self) {
+        self.0.clear_copy_marquee()
+    }
+    fn wait(&self, d: std::time::Duration) {
+        self.0.wait(d)
+    }
 }
 
 impl SheetsPorts {
