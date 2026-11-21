@@ -53,6 +53,12 @@ pub enum ReplaceError {
     ContextChanged,
     #[error("{0}")]
     Paste(String),
+    /// Sheets 셀 편집: 번역 결과가 (앞 공백 뒤) `=`/`+`로 시작해 수식으로 해석된다.
+    #[error("translation_starts_with_formula_prefix")]
+    FormulaPrefix,
+    /// Sheets 셀 편집: 선택이 없는데 셀 전체 교체가 꺼져 있다.
+    #[error("full_cell_replace_not_enabled")]
+    FullCellNotEnabled,
 }
 
 pub struct ChromeAdapter {
@@ -281,6 +287,7 @@ mod tests {
             name: "Message".into(),
             full_text: "hello world".into(),
             selection_text: selection.map(String::from),
+            editor_full_text: None,
         }
     }
 
@@ -291,6 +298,7 @@ mod tests {
             name: String::new(),
             full_text: full.into(),
             selection_text: None,
+            editor_full_text: None,
         }
     }
 
@@ -670,6 +678,7 @@ mod tests {
             name: String::new(),
             full_text: String::new(),
             selection_text: selection.map(String::from),
+            editor_full_text: None,
         }
     }
 
@@ -691,6 +700,36 @@ mod tests {
         );
         let ok = adapter(vec![Some(docs(Some("abc")))]).0.try_capture();
         assert!(ok.is_ok_and(|c| c.context.has_selection));
+    }
+
+    fn sheets_editor(full: &str, selection: Option<&str>) -> FocusedElement {
+        FocusedElement {
+            url: "https://docs.google.com/spreadsheets/d/abc/edit#gid=0".into(),
+            role: Role::SheetsCellEditor,
+            name: "B12".into(),
+            full_text: String::new(),
+            selection_text: selection.map(String::from),
+            editor_full_text: Some(full.into()),
+        }
+    }
+
+    #[test]
+    fn sheets_cell_editor_captures_through_replace_strategies() {
+        let c = adapter(vec![Some(sheets_editor("안녕 세계", Some("안녕")))])
+            .0
+            .try_capture()
+            .unwrap();
+        assert_eq!(c.context.app, "google_sheets");
+        assert_eq!(c.context.field_id, "sheets_cell_edit");
+        assert_eq!(c.context.text, "안녕");
+        // 수식 셀은 재시도해도 같으므로 NoContext.
+        assert_eq!(
+            adapter(vec![Some(sheets_editor("=A1", Some("A1")))])
+                .0
+                .try_capture()
+                .unwrap_err(),
+            CaptureMiss::NoContext
+        );
     }
 
     #[test]

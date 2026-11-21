@@ -1,6 +1,7 @@
-//! Google 앱별 캡처 전략 (Chat/Gmail/Docs/Slides).
+//! Google 앱별 캡처 전략 (Chat/Gmail/Docs/Slides/Sheets 셀 편집).
 
 use super::role::{Role, is_docs_url, is_google_chat_url, is_slides_url};
+use ct_sheets::routing::is_google_sheets_url;
 
 /// 포커스된 요소의 스냅샷.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -10,6 +11,8 @@ pub struct FocusedElement {
     pub name: String,
     pub full_text: String,
     pub selection_text: Option<String>,
+    /// Sheets 셀 편집기의 ValuePattern 값(끝의 줄바꿈 하나 제거). Sheets 편집기가 아니거나 못 읽으면 None.
+    pub editor_full_text: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -28,20 +31,23 @@ pub enum Strategy {
     GmailReadOnly,
     GoogleDocs,
     GoogleSlides,
+    GoogleSheetsCellEdit,
 }
 
-pub const REPLACE_STRATEGIES: [Strategy; 4] = [
+pub const REPLACE_STRATEGIES: [Strategy; 5] = [
     Strategy::GoogleChat,
     Strategy::Gmail,
     Strategy::GoogleDocs,
     Strategy::GoogleSlides,
+    Strategy::GoogleSheetsCellEdit,
 ];
 
-pub const READ_ONLY_STRATEGIES: [Strategy; 4] = [
+pub const READ_ONLY_STRATEGIES: [Strategy; 5] = [
     Strategy::GoogleChatReadOnly,
     Strategy::GmailReadOnly,
     Strategy::GoogleDocs,
     Strategy::GoogleSlides,
+    Strategy::GoogleSheetsCellEdit,
 ];
 
 impl Strategy {
@@ -54,6 +60,9 @@ impl Strategy {
             Strategy::Gmail | Strategy::GmailReadOnly => f.url.contains("mail.google.com"),
             Strategy::GoogleDocs => is_docs_url(&f.url),
             Strategy::GoogleSlides => is_slides_url(&f.url),
+            Strategy::GoogleSheetsCellEdit => {
+                is_google_sheets_url(&f.url) && is_sheets_editor_role(f.role)
+            }
         }
     }
 
@@ -110,8 +119,31 @@ impl Strategy {
                 }
                 None
             }
+            // S-ref §5.2. 수식 셀은 일부만 선택했어도 대상이 아니다. 서식 있는 셀은 일반 텍스트로 교체한다.
+            Strategy::GoogleSheetsCellEdit => {
+                let full = f.editor_full_text.as_deref()?;
+                if full.trim_start().starts_with('=') {
+                    return None;
+                }
+                let (has_selection, text) = match non_empty_selection(f) {
+                    Some(sel) => (true, sel.to_string()),
+                    None if full.trim().is_empty() => return None,
+                    None => (false, full.to_string()),
+                };
+                Some(EditingContext {
+                    app: "google_sheets",
+                    field_id: "sheets_cell_edit",
+                    has_selection,
+                    text,
+                })
+            }
         }
     }
+}
+
+/// Sheets 셀 편집기 또는 수식 입력줄.
+pub fn is_sheets_editor_role(role: Role) -> bool {
+    matches!(role, Role::SheetsCellEditor | Role::SheetsFormulaBar)
 }
 
 fn is_gmail_field_role(role: Role) -> bool {
@@ -157,6 +189,7 @@ mod tests {
             name: String::new(),
             full_text: full.to_string(),
             selection_text: sel.map(str::to_string),
+            editor_full_text: None,
         }
     }
 
@@ -452,5 +485,122 @@ mod tests {
     fn slides_other_roles_without_selection_refuse() {
         let e = fe(SLIDES, Role::Unknown, "text", None);
         assert_eq!(Strategy::GoogleSlides.identify_context(&e), None);
+    }
+
+    const SHEETS: &str = "https://docs.google.com/spreadsheets/d/abc/edit#gid=0";
+
+    fn sheets(role: Role, full: Option<&str>, sel: Option<&str>) -> FocusedElement {
+        FocusedElement {
+            url: SHEETS.to_string(),
+            role,
+            name: String::new(),
+            full_text: String::new(),
+            selection_text: sel.map(str::to_string),
+            editor_full_text: full.map(str::to_string),
+        }
+    }
+
+    fn sheets_cell(full: Option<&str>, sel: Option<&str>) -> FocusedElement {
+        sheets(Role::SheetsCellEditor, full, sel)
+    }
+
+    const S: Strategy = Strategy::GoogleSheetsCellEdit;
+
+    #[test]
+    fn strategy_lists_end_with_sheets_cell_edit() {
+        assert_eq!(REPLACE_STRATEGIES.len(), 5);
+        assert_eq!(READ_ONLY_STRATEGIES.len(), 5);
+        assert_eq!(REPLACE_STRATEGIES[4], Strategy::GoogleSheetsCellEdit);
+        assert_eq!(READ_ONLY_STRATEGIES[4], Strategy::GoogleSheetsCellEdit);
+    }
+
+    #[test]
+    fn non_sheets_element_has_no_editor_text() {
+        assert_eq!(fe(CHAT, Role::Compose, "x", None).editor_full_text, None);
+    }
+
+    #[test]
+    fn sheets_matches_only_editor_roles() {
+        let ok = Some("안녕 세계");
+        assert!(S.matches(&sheets(Role::SheetsCellEditor, ok, None)));
+        assert!(S.matches(&sheets(Role::SheetsFormulaBar, ok, None)));
+        assert!(!S.matches(&sheets(Role::SheetsGrid, ok, None)));
+        assert!(!S.matches(&sheets(Role::SheetsNameBox, ok, None)));
+        assert!(!S.matches(&sheets(Role::Unknown, ok, None)));
+        assert!(!S.matches(&fe(GMAIL, Role::Body, "x", None)));
+    }
+
+    #[test]
+    fn sheets_strategy_does_not_match_docs_or_slides_and_they_ignore_sheets() {
+        for url in [DOCS, SLIDES] {
+            let mut e = sheets_cell(Some("안녕 세계"), None);
+            e.url = url.to_string();
+            assert!(!S.matches(&e));
+        }
+        let e = sheets_cell(Some("안녕 세계"), None);
+        assert!(!Strategy::GoogleDocs.matches(&e));
+        assert!(!Strategy::GoogleSlides.matches(&e));
+    }
+
+    #[test]
+    fn sheets_selection_inside_formula_is_rejected() {
+        let e = sheets_cell(Some("=CONCAT(\"abc\")"), Some("abc"));
+        assert_eq!(S.identify_context(&e), None);
+    }
+
+    #[test]
+    fn sheets_formula_without_selection_is_rejected() {
+        let e = sheets_cell(Some("  =SUM(A1:A3)"), None);
+        assert_eq!(S.identify_context(&e), None);
+    }
+
+    #[test]
+    fn sheets_selection_only_is_targeted() {
+        let e = sheets_cell(Some("안녕 세계"), Some("안녕"));
+        assert_eq!(
+            S.identify_context(&e),
+            Some(ctx("google_sheets", "sheets_cell_edit", true, "안녕"))
+        );
+    }
+
+    #[test]
+    fn sheets_no_selection_uses_full_cell_text() {
+        let e = sheets_cell(Some("안녕 세계"), None);
+        assert_eq!(
+            S.identify_context(&e),
+            Some(ctx("google_sheets", "sheets_cell_edit", false, "안녕 세계"))
+        );
+        // 빈 문자열 선택은 선택 없음이다.
+        let e = sheets_cell(Some("안녕 세계"), Some(""));
+        assert_eq!(S.identify_context(&e).map(|c| c.has_selection), Some(false));
+    }
+
+    #[test]
+    fn sheets_formula_bar_role_is_targeted_too() {
+        let e = sheets(Role::SheetsFormulaBar, Some("안녕 세계"), None);
+        assert_eq!(
+            S.identify_context(&e),
+            Some(ctx("google_sheets", "sheets_cell_edit", false, "안녕 세계"))
+        );
+    }
+
+    #[test]
+    fn sheets_empty_cell_without_selection_is_rejected() {
+        assert_eq!(S.identify_context(&sheets_cell(Some("  "), None)), None);
+        assert_eq!(S.identify_context(&sheets_cell(Some(""), None)), None);
+    }
+
+    #[test]
+    fn sheets_unknown_full_text_is_rejected() {
+        assert_eq!(S.identify_context(&sheets_cell(None, Some("안녕"))), None);
+    }
+
+    #[test]
+    fn sheets_whitespace_selection_in_plain_cell_counts_as_selection() {
+        let e = sheets_cell(Some("a  b"), Some("  "));
+        assert_eq!(
+            S.identify_context(&e),
+            Some(ctx("google_sheets", "sheets_cell_edit", true, "  "))
+        );
     }
 }

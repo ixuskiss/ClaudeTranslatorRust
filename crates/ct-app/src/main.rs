@@ -37,6 +37,7 @@ use ct_win::chrome::{
     UiaBackend, WindowsUiaBackend,
 };
 use ct_win::clipboard::{Clipboard, Win32Clipboard};
+use ct_win::format_clipboard::Win32FormatClipboard;
 use ct_win::hotkey::{ChordRouter, Gesture, KeyboardHook};
 use ct_win::keys::{
     KeySender, MODIFIER_RELEASE_TIMEOUT, Win32KeySender, wait_for_modifiers_released,
@@ -462,7 +463,11 @@ fn main() {
 
     let keys = Arc::new(Win32KeySender);
     let clipboard: Arc<dyn Clipboard> = Arc::new(Win32Clipboard);
-    let uia = Arc::new(WindowsUiaBackend::new(keys.clone(), Arc::clone(&clipboard)));
+    let uia = Arc::new(WindowsUiaBackend::new(
+        keys.clone(),
+        Arc::clone(&clipboard),
+        Arc::new(Win32FormatClipboard),
+    ));
     let replace = RetryingInteraction::new(ChromeAdapter::new(
         uia.clone(),
         Arc::clone(&clipboard),

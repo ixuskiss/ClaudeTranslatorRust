@@ -1015,6 +1015,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "ct-core",
+ "ct-sheets",
  "thiserror 2.0.21",
  "tracing",
  "windows",

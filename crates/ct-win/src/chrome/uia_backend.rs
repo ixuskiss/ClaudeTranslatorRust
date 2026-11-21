@@ -1,14 +1,17 @@
 //! Windows UI Automation 백엔드 (v5 참조 §2.6).
 //!
-//! UIA는 포그라운드 창, omnibox URL, 포커스된 요소의 Name/ControlType, 렌더 위젯
-//! `SetFocus`에만 쓴다. 텍스트는 모두 클립보드 왕복(Ctrl+C)으로 읽는다.
+//! UIA는 포그라운드 창, omnibox URL, 포커스된 요소의 Name/ControlType(Sheets면 AutomationId), 렌더 위젯
+//! `SetFocus`, Sheets 셀 편집기의 ValuePattern에만 쓴다. 그 밖의 텍스트는 클립보드 왕복(Ctrl+C)으로 읽는다.
 //! 캡처한 텍스트는 절대 로그에 남기지 않는다.
 
 use super::adapter::UiaBackend;
 use super::role::{Role, classify_focused_role, is_docs_url, is_slides_url, is_supported_url};
-use super::strategy::FocusedElement;
+use super::strategy::{FocusedElement, is_sheets_editor_role};
 use crate::clipboard::{Clipboard, copy_with_sentinel};
+use crate::format_clipboard::{ClipboardGuard, FormatClipboard, wait_for_clipboard_change};
 use crate::keys::{ALT_RELEASE_TIMEOUT, Chord, KeySender, wait_until_alt_released};
+use ct_sheets::html_rich_text_state;
+use ct_sheets::routing::is_google_sheets_url;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::thread::sleep;
@@ -34,6 +37,9 @@ const OMNIBOX_SEARCH_DEPTH: u32 = 20;
 pub const SELECT_ALL_SETTLE: Duration = Duration::from_millis(200);
 /// Esc로 툴바 포커스를 되돌린 뒤 다시 읽기 전 대기.
 pub const ESCAPE_RECOVERY_DELAY: Duration = Duration::from_millis(100);
+/// Sheets 셀 편집기 복사가 클립보드를 바꿀 때까지 기다리는 최대 시간(S-ref §5.1). 폴링은 20 ms.
+pub const SHEETS_COPY_TIMEOUT: Duration = Duration::from_millis(300);
+const HTML_FORMAT: &str = "HTML Format";
 /// Ctrl+V 뒤 Chrome이 붙여넣기를 소비할 때까지 기다리는 시간(P5).
 pub const PASTE_SETTLE: Duration = Duration::from_millis(500);
 
@@ -53,16 +59,51 @@ pub fn full_text_fallback_allowed(role: Role) -> bool {
 }
 
 /// UIA ControlType 숫자를 `classify_focused_role`이 쓰는 이름으로 바꾼다.
-/// 분류에 쓰지 않는 종류는 빈 문자열이다.
+/// 표준 종류(50000~50040)는 모두 이름을 준다. Sheets 분기는 빈 이름을 표 그리드로 보므로
+/// 메뉴 항목 등 다른 종류가 빈 문자열이 되면 안 된다. 모르는 값만 빈 문자열이다.
 pub fn control_type_name(id: i32) -> &'static str {
     match id {
         50000 => "ButtonControl",
+        50001 => "CalendarControl",
+        50002 => "CheckBoxControl",
+        50003 => "ComboBoxControl",
         50004 => "EditControl",
+        50005 => "HyperlinkControl",
+        50006 => "ImageControl",
+        50007 => "ListItemControl",
+        50008 => "ListControl",
+        50009 => "MenuControl",
+        50010 => "MenuBarControl",
+        50011 => "MenuItemControl",
+        50012 => "ProgressBarControl",
+        50013 => "RadioButtonControl",
+        50014 => "ScrollBarControl",
+        50015 => "SliderControl",
+        50016 => "SpinnerControl",
+        50017 => "StatusBarControl",
+        50018 => "TabControl",
+        50019 => "TabItemControl",
         50020 => "TextControl",
+        50021 => "ToolBarControl",
+        50022 => "ToolTipControl",
+        50023 => "TreeControl",
+        50024 => "TreeItemControl",
         50025 => "CustomControl",
         50026 => "GroupControl",
+        50027 => "ThumbControl",
+        50028 => "DataGridControl",
+        50029 => "DataItemControl",
         50030 => "DocumentControl",
+        50031 => "SplitButtonControl",
+        50032 => "WindowControl",
         50033 => "PaneControl",
+        50034 => "HeaderControl",
+        50035 => "HeaderItemControl",
+        50036 => "TableControl",
+        50037 => "TitleBarControl",
+        50038 => "SeparatorControl",
+        50039 => "SemanticZoomControl",
+        50040 => "AppBarControl",
         _ => "",
     }
 }
@@ -78,11 +119,20 @@ pub fn cursor_position() -> Option<(i32, i32)> {
 pub struct WindowsUiaBackend {
     keys: Arc<dyn KeySender>,
     clipboard: Arc<dyn Clipboard>,
+    format_clipboard: Arc<dyn FormatClipboard>,
 }
 
 impl WindowsUiaBackend {
-    pub fn new(keys: Arc<dyn KeySender>, clipboard: Arc<dyn Clipboard>) -> Self {
-        WindowsUiaBackend { keys, clipboard }
+    pub fn new(
+        keys: Arc<dyn KeySender>,
+        clipboard: Arc<dyn Clipboard>,
+        format_clipboard: Arc<dyn FormatClipboard>,
+    ) -> Self {
+        WindowsUiaBackend {
+            keys,
+            clipboard,
+            format_clipboard,
+        }
     }
 }
 
@@ -92,11 +142,12 @@ impl UiaBackend for WindowsUiaBackend {
         wait_until_alt_released(self.keys.as_ref(), ALT_RELEASE_TIMEOUT);
 
         let url = window.url();
-        let focused = window.focused()?;
-        let (mut name, mut control_type) = focused;
-        let mut role = classify_focused_role(&url, &name, control_type);
+        // AutomationId는 Sheets URL일 때만 읽는다(S-ref §1.3).
+        let read_id = is_google_sheets_url(&url);
+        let mut focused = window.focused(read_id)?;
+        let mut role = focused.classify(&url);
 
-        if needs_toolbar_recovery(control_type, role, &url) {
+        if needs_toolbar_recovery(focused.control_type, role, &url) {
             let recovered = url.contains("docs.google.com") && window.focus_render_widget();
             if !recovered {
                 // Docs/Slides에서는 Esc가 텍스트 선택을 지우므로 SetFocus가 실패했을 때만 온다.
@@ -106,21 +157,24 @@ impl UiaBackend for WindowsUiaBackend {
                 sleep(ESCAPE_RECOVERY_DELAY);
             }
             // 복구 뒤 포커스를 다시 못 읽으면 툴바 버튼에 Ctrl+C를 보내지 않고 중단한다(v5 §2.6 1e/1g).
-            let Some((n, ct)) = window.focused() else {
+            let Some(f) = window.focused(read_id) else {
                 tracing::debug!(recovered, "toolbar focus recovery: focus unreadable");
                 return None;
             };
-            name = n;
-            control_type = ct;
-            role = classify_focused_role(&url, &name, control_type);
+            focused = f;
+            role = focused.classify(&url);
             tracing::debug!(recovered, ?role, "toolbar focus recovery");
+        }
+
+        if is_sheets_editor_role(role) {
+            return Some(self.sheets_editor_element(url, role, focused));
         }
 
         let (full_text, selection_text) =
             capture_texts(self.keys.as_ref(), self.clipboard.as_ref(), role);
         tracing::debug!(
             ?role,
-            control_type,
+            control_type = focused.control_type,
             selection_chars = selection_text.as_ref().map(|s| s.chars().count()),
             full_text_chars = full_text.chars().count(),
             "focused element captured"
@@ -128,9 +182,10 @@ impl UiaBackend for WindowsUiaBackend {
         Some(FocusedElement {
             url,
             role,
-            name,
+            name: focused.name,
             full_text,
             selection_text,
+            editor_full_text: None,
         })
     }
 
@@ -150,10 +205,76 @@ impl UiaBackend for WindowsUiaBackend {
     }
 }
 
+impl WindowsUiaBackend {
+    /// S-ref §5.1. sentinel·Ctrl+A 없이 Ctrl+C 한 번과 시퀀스 번호로 선택을 판정하고,
+    /// 셀 전체 텍스트는 ValuePattern으로 읽는다. 클립보드 구간 잠금은 호출하는 어댑터가 잡고 있다.
+    fn sheets_editor_element(&self, url: String, role: Role, focused: Focused) -> FocusedElement {
+        let (selection_text, html) =
+            copy_editor_selection(self.keys.as_ref(), self.format_clipboard.as_ref());
+        let editor_full_text = focused.value().map(strip_one_trailing_newline);
+        let rich = html.as_deref().and_then(html_rich_text_state);
+        tracing::debug!(
+            ?role,
+            full_chars = editor_full_text.as_ref().map(|s| s.chars().count()),
+            selection_chars = selection_text.as_ref().map(|s| s.chars().count()),
+            rich,
+            "sheets editor capture"
+        );
+        FocusedElement {
+            url,
+            role,
+            name: focused.name,
+            full_text: String::new(),
+            selection_text,
+            editor_full_text,
+        }
+    }
+}
+
 /// Alt가 떼지기를 기다린 뒤 키를 보낸다(Alt가 눌린 채면 Alt+Esc 등 창 전환이 된다).
 fn send_chord(keys: &dyn KeySender, chord: Chord) -> Result<(), String> {
     wait_until_alt_released(keys, ALT_RELEASE_TIMEOUT);
     keys.send(chord).map_err(|e| e.to_string())
+}
+
+/// Sheets 셀 편집기 복사: (선택 텍스트, 클립보드 HTML). 다중 포맷 가드로 사용자 클립보드를
+/// 되돌린다. 빈 선택이면 Chrome이 아무것도 복사하지 않으므로 0.3초 안에 시퀀스 번호가
+/// 바뀌지 않으면 선택 없음이다. Ctrl+A는 보내지 않는다.
+fn copy_editor_selection(
+    keys: &dyn KeySender,
+    cb: &dyn FormatClipboard,
+) -> (Option<String>, Option<String>) {
+    let mut guard = ClipboardGuard::begin(cb);
+    let before = cb.sequence_number();
+    let copied = match send_chord(keys, Chord::CtrlC) {
+        Ok(()) => wait_for_clipboard_change(cb, before, SHEETS_COPY_TIMEOUT),
+        Err(_) => {
+            tracing::debug!("sheets editor copy key failed");
+            false
+        }
+    };
+    let result = if copied {
+        guard.mark_own_write();
+        let text = cb.read_text().filter(|t| !t.is_empty());
+        let html = cb.read_registered(HTML_FORMAT).map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .to_string()
+        });
+        (text, html)
+    } else {
+        (None, None)
+    };
+    guard.finish();
+    result
+}
+
+/// ValuePattern 값 끝의 `\n` 하나만 지운다(Sheets 편집기가 붙인다).
+fn strip_one_trailing_newline(mut value: String) -> String {
+    if value.ends_with('\n') {
+        value.pop();
+    }
+    value
 }
 
 /// (full_text, selection_text). 선택이 있으면 full_text는 빈 문자열이다.
@@ -267,14 +388,26 @@ impl ChromeWindow {
         }
     }
 
-    /// 포커스된 요소의 (Name, ControlType 이름). 없으면 None.
-    fn focused(&self) -> Option<(String, &'static str)> {
+    /// 포커스된 요소와 Name, ControlType 이름. `read_automation_id`면 AutomationId도 읽는다.
+    fn focused(&self, read_automation_id: bool) -> Option<Focused> {
         // SAFETY: 이 스레드의 UIA로 조회한다.
         unsafe {
             let el = self.uia.GetFocusedElement().ok()?;
             let name = el.CurrentName().map(|n| n.to_string()).unwrap_or_default();
             let ct = el.CurrentControlType().map(|c| c.0).unwrap_or(0);
-            Some((name, control_type_name(ct)))
+            let automation_id = if read_automation_id {
+                el.CurrentAutomationId()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Some(Focused {
+                element: el,
+                name,
+                control_type: control_type_name(ct),
+                automation_id,
+            })
         }
     }
 
@@ -301,6 +434,33 @@ impl ChromeWindow {
         // SAFETY: 이 스레드의 UIA로 만든다.
         let walker = unsafe { self.uia.ControlViewWalker() }.ok()?;
         find_in(&walker, &self.element, class, control_type, 1, max_depth)
+    }
+}
+
+/// 포커스된 UIA 요소 스냅샷. 만든 스레드 안에서만 쓴다.
+struct Focused {
+    element: IUIAutomationElement,
+    name: String,
+    control_type: &'static str,
+    /// Sheets URL이 아니면 읽지 않아 빈 문자열이다.
+    automation_id: String,
+}
+
+impl Focused {
+    fn classify(&self, url: &str) -> Role {
+        classify_focused_role(url, &self.name, self.control_type, &self.automation_id)
+    }
+
+    /// ValuePattern 값. 읽지 못하면 None.
+    fn value(&self) -> Option<String> {
+        // SAFETY: 이 스레드에서 얻은 요소에 대한 조회 호출.
+        unsafe {
+            let pattern = self
+                .element
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                .ok()?;
+            pattern.CurrentValue().ok().map(|v| v.to_string())
+        }
     }
 }
 
@@ -336,6 +496,7 @@ fn find_in(
 mod tests {
     use super::*;
     use crate::clipboard::ClipboardError;
+    use crate::format_clipboard::ClipboardSnapshot;
     use crate::hotkey::Modifier;
     use crate::keys::KeyError;
     use std::sync::Mutex;
@@ -416,7 +577,12 @@ mod tests {
         assert_eq!(control_type_name(50026), "GroupControl");
         assert_eq!(control_type_name(50025), "CustomControl");
         assert_eq!(control_type_name(50020), "TextControl");
-        assert_eq!(control_type_name(50003), "");
+        assert_eq!(control_type_name(50003), "ComboBoxControl");
+        assert_eq!(control_type_name(50011), "MenuItemControl");
+        assert_eq!(control_type_name(50032), "WindowControl");
+        assert_eq!(control_type_name(50019), "TabItemControl");
+        assert_eq!(control_type_name(50005), "HyperlinkControl");
+        assert_eq!(control_type_name(49999), "");
         assert_eq!(control_type_name(0), "");
     }
 
@@ -532,5 +698,136 @@ mod tests {
         paste_replacing_full_text_with(f.as_ref()).unwrap();
         assert!(start.elapsed() >= SELECT_ALL_SETTLE + PASTE_SETTLE);
         assert_eq!(f.sent(), vec![Chord::CtrlA, Chord::CtrlV]);
+    }
+
+    /// 다중 포맷 클립보드 + 키 가짜. Ctrl+C는 `copy`가 있으면 텍스트·HTML을 쓰고 시퀀스를 올린다.
+    struct EditorFake {
+        seq: Mutex<u32>,
+        text: Mutex<Option<String>>,
+        html: Mutex<Option<Vec<u8>>>,
+        sent: Mutex<Vec<Chord>>,
+        restores: Mutex<Vec<ClipboardSnapshot>>,
+        copy: Option<(&'static str, &'static str)>,
+    }
+
+    impl EditorFake {
+        fn new(copy: Option<(&'static str, &'static str)>) -> EditorFake {
+            EditorFake {
+                seq: Mutex::new(7),
+                text: Mutex::new(Some("user clipboard".into())),
+                html: Mutex::new(None),
+                sent: Mutex::new(Vec::new()),
+                restores: Mutex::new(Vec::new()),
+                copy,
+            }
+        }
+        fn snapshot_value() -> ClipboardSnapshot {
+            ClipboardSnapshot::new(vec![(13, b"u\0s\0e\0r\0\0\0".to_vec())])
+        }
+    }
+
+    impl FormatClipboard for EditorFake {
+        fn sequence_number(&self) -> u32 {
+            *self.seq.lock().unwrap()
+        }
+        fn snapshot(&self) -> Option<ClipboardSnapshot> {
+            Some(EditorFake::snapshot_value())
+        }
+        fn restore(&self, snapshot: &ClipboardSnapshot) -> Result<(), ClipboardError> {
+            self.restores.lock().unwrap().push(snapshot.clone());
+            *self.seq.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn read_text(&self) -> Option<String> {
+            self.text.lock().unwrap().clone()
+        }
+        fn read_registered(&self, format_name: &str) -> Option<Vec<u8>> {
+            assert_eq!(format_name, "HTML Format");
+            self.html.lock().unwrap().clone()
+        }
+        fn write_registered(&self, _: &[(&str, &[u8])]) -> Result<(), ClipboardError> {
+            unreachable!("editor capture never writes")
+        }
+    }
+
+    impl KeySender for EditorFake {
+        fn send(&self, chord: Chord) -> Result<(), KeyError> {
+            self.sent.lock().unwrap().push(chord);
+            if chord == Chord::CtrlC
+                && let Some((text, html)) = self.copy
+            {
+                *self.text.lock().unwrap() = Some(text.into());
+                let mut bytes = html.as_bytes().to_vec();
+                bytes.push(0);
+                *self.html.lock().unwrap() = Some(bytes);
+                *self.seq.lock().unwrap() += 1;
+            }
+            Ok(())
+        }
+        fn is_down(&self, _m: Modifier) -> bool {
+            false
+        }
+    }
+
+    const EDITOR_HTML: &str = "<span data-sheets-root=\"1\">picked</span>";
+
+    #[test]
+    fn editor_capture_never_sends_select_all() {
+        let f = EditorFake::new(Some(("picked", EDITOR_HTML)));
+        let (selection, html) = copy_editor_selection(&f, &f);
+        assert_eq!(selection.as_deref(), Some("picked"));
+        assert_eq!(html.as_deref(), Some(EDITOR_HTML));
+        assert_eq!(*f.sent.lock().unwrap(), vec![Chord::CtrlC]);
+        // 우리 복사가 바꾼 클립보드는 사용자 내용으로 되돌린다.
+        assert_eq!(
+            *f.restores.lock().unwrap(),
+            vec![EditorFake::snapshot_value()]
+        );
+    }
+
+    #[test]
+    fn editor_copy_without_clipboard_change_is_no_selection() {
+        let f = EditorFake::new(None);
+        let start = std::time::Instant::now();
+        let (selection, html) = copy_editor_selection(&f, &f);
+        assert_eq!((selection, html), (None, None));
+        assert!(start.elapsed() >= SHEETS_COPY_TIMEOUT);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(*f.sent.lock().unwrap(), vec![Chord::CtrlC]);
+        // 우리가 쓰지 않았으므로 복원하지 않는다.
+        assert!(f.restores.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn editor_copy_of_empty_text_is_no_selection() {
+        let f = EditorFake::new(Some(("", "")));
+        let (selection, _) = copy_editor_selection(&f, &f);
+        assert_eq!(selection, None);
+        assert_eq!(*f.sent.lock().unwrap(), vec![Chord::CtrlC]);
+    }
+
+    #[test]
+    fn editor_value_drops_exactly_one_trailing_newline() {
+        assert_eq!(strip_one_trailing_newline("abc\n".into()), "abc");
+        assert_eq!(strip_one_trailing_newline("abc\n\n".into()), "abc\n");
+        assert_eq!(strip_one_trailing_newline("abc".into()), "abc");
+        assert_eq!(strip_one_trailing_newline("\n".into()), "");
+        assert_eq!(strip_one_trailing_newline("a\nb ".into()), "a\nb ");
+    }
+
+    #[test]
+    fn editor_roles_use_editor_capture() {
+        assert!(is_sheets_editor_role(Role::SheetsCellEditor));
+        assert!(is_sheets_editor_role(Role::SheetsFormulaBar));
+        for role in [
+            Role::SheetsGrid,
+            Role::SheetsNameBox,
+            Role::Compose,
+            Role::Unknown,
+        ] {
+            assert!(!is_sheets_editor_role(role), "{role:?}");
+        }
+        assert!(!full_text_fallback_allowed(Role::SheetsCellEditor));
+        assert!(!full_text_fallback_allowed(Role::SheetsGrid));
     }
 }
