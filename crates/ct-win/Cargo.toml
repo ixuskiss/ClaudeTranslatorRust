@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 ct-core = { path = "../ct-core" }
+ct-sheets = { path = "../ct-sheets" }
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

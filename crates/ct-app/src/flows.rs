@@ -78,6 +78,8 @@ fn replace_error_kind(e: &ReplaceError) -> &'static str {
         ReplaceError::Unsupported => "unsupported",
         ReplaceError::ContextChanged => "context_changed",
         ReplaceError::Paste(_) => "paste",
+        ReplaceError::FormulaPrefix => "formula_prefix",
+        ReplaceError::FullCellNotEnabled => "full_cell_not_enabled",
     }
 }
 
