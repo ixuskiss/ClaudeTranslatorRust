@@ -70,6 +70,8 @@ component Row inherits HorizontalLayout {
     in property <string> title;
     in property <string> description;
     in property <bool> description-visible: root.description != "";
+    // Width of the control slot on the right; widen it for long combo box items.
+    in property <length> control-width: 260px;
     padding-top: 8px;
     padding-bottom: 8px;
     spacing: 12px;
@@ -82,7 +84,7 @@ component Row inherits HorizontalLayout {
     }
 
     Rectangle {
-        width: 260px;
+        width: root.control-width;
 
         HorizontalLayout {
             alignment: end;
@@ -374,7 +376,10 @@ export component SettingsWin inherits Window {
 
                     Row {
                         title: "교정 범위";
+                        // Wide enough to show "오탈자,띄어쓰기 교정,문장 다듬기" in full.
+                        control-width: 320px;
                         ComboBox {
+                            width: 320px;
                             model: root.correction-items;
                             current-index <=> root.correction-index;
                         }
