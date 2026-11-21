@@ -25,6 +25,7 @@ pub const MSG_CORRECTION_REPLACE_NO_SELECTION: &str =
     "텍스트를 선택한 후 Ctrl+Alt+Alt를 눌러주세요.";
 pub const MSG_CORRECTION_VIEW_NO_SELECTION: &str =
     "텍스트를 선택한 후 Alt+Ctrl+Ctrl을 실행해주세요.";
+pub const MSG_CORRECTION_FAILED: &str = "교정에 실패하여 원본을 변경하지 않았습니다.";
 
 const LOADING_TEXT: &str = "Translating...";
 

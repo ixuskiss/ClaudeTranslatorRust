@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use ct_app::dispatch::{AppState, Dispatcher, GestureAction, Snapshot};
 use ct_app::flows::{
-    Badge, ExplainView, FlowDeps, MSG_CLI_UNAVAILABLE, MSG_EXPLAIN_FAILED, MSG_TRANSLATE_FAILED,
-    Notifier, alt_alt_flow, ctrl_ctrl_flow,
+    Badge, ExplainView, FlowDeps, MSG_CLI_UNAVAILABLE, MSG_CORRECTION_FAILED, MSG_EXPLAIN_FAILED,
+    MSG_TRANSLATE_FAILED, Notifier, alt_alt_flow, correction_replace_flow, correction_view_flow,
+    ctrl_ctrl_flow,
 };
 use ct_app::logging;
 use ct_app::ui::tray::{Tray, TrayCommand};
@@ -37,7 +38,7 @@ use ct_win::chrome::{
 };
 use ct_win::clipboard::{Clipboard, Win32Clipboard};
 use ct_win::hotkey::{ChordRouter, Gesture, KeyboardHook};
-use ct_win::keys::{KeySender, Win32KeySender};
+use ct_win::keys::{KeySender, Win32KeySender, wait_for_modifiers_released};
 use ct_win::registry::apply_autostart;
 use ct_win::single_instance::{ALREADY_RUNNING_MESSAGE, SINGLE_INSTANCE_NAME, SingleInstance};
 
@@ -50,6 +51,8 @@ const MODELS_CACHE_FILE: &str = "models_cache.json";
 const TRAY_POLL: Duration = Duration::from_millis(50);
 /// How long Exit waits for the CLI process to be closed before leaving anyway.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
+/// How long a correction gesture waits for the held modifier keys to be released.
+const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Autostart is written only by release builds (P7).
 const IS_RELEASE: bool = cfg!(not(debug_assertions));
 
@@ -100,6 +103,8 @@ struct AppAction {
     replace: Box<dyn TextInteraction>,
     view_only: Box<dyn TextInteraction>,
     docs_or_slides: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Waits (bounded) for the gesture's modifier keys to be released.
+    modifiers_released: Box<dyn Fn() -> bool + Send + Sync>,
     badge: Arc<dyn Badge>,
     notifier: Arc<dyn Notifier>,
     view: Arc<dyn ExplainView>,
@@ -122,22 +127,35 @@ impl GestureAction for AppAction {
                 self.notifier.as_ref(),
             ),
             Gesture::CtrlCtrl => ctrl_ctrl_flow(&deps, self.view_only.as_ref(), self.view.as_ref()),
-            Gesture::CtrlHeldAltAlt | Gesture::AltHeldCtrlCtrl => {
-                tracing::info!(?gesture, "gesture not handled in this version");
-            }
+            Gesture::CtrlHeldAltAlt => correction_replace_flow(
+                &deps,
+                self.replace.as_ref(),
+                self.modifiers_released.as_ref(),
+                self.badge.as_ref(),
+                self.notifier.as_ref(),
+            ),
+            Gesture::AltHeldCtrlCtrl => correction_view_flow(
+                &deps,
+                self.view_only.as_ref(),
+                self.modifiers_released.as_ref(),
+                self.view.as_ref(),
+            ),
         }
     }
 
     /// Ruling R5: tell the user the run failed (the original text was not replaced).
     fn on_panic(&self, gesture: Gesture) {
         match gesture {
-            Gesture::AltAlt | Gesture::CtrlHeldAltAlt => {
+            Gesture::AltAlt => {
                 self.badge.hide();
                 self.notifier.notify(MSG_TRANSLATE_FAILED);
             }
-            Gesture::CtrlCtrl | Gesture::AltHeldCtrlCtrl => {
-                self.view.show_error(MSG_EXPLAIN_FAILED);
+            Gesture::CtrlHeldAltAlt => {
+                self.badge.hide();
+                self.notifier.notify(MSG_CORRECTION_FAILED);
             }
+            Gesture::CtrlCtrl => self.view.show_error(MSG_EXPLAIN_FAILED),
+            Gesture::AltHeldCtrlCtrl => self.view.show_error(MSG_CORRECTION_FAILED),
         }
     }
 }
@@ -471,11 +489,15 @@ fn main() {
         }
     };
 
+    let keys_for_wait = keys.clone();
     let action = AppAction {
         detector: Box::new(RuleBasedDetector),
         replace: Box::new(replace),
         view_only: Box::new(view_only),
         docs_or_slides: Box::new(move || uia.foreground_is_docs_or_slides()),
+        modifiers_released: Box::new(move || {
+            wait_for_modifiers_released(keys_for_wait.as_ref(), MODIFIER_RELEASE_TIMEOUT)
+        }),
         badge,
         notifier: explain.clone(),
         view: explain,
@@ -558,7 +580,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ct_core::{DisplayMode, ExplanationResult};
+    use ct_app::flows::{MSG_CORRECTION_REPLACE_NO_SELECTION, MSG_CORRECTION_VIEW_NO_SELECTION};
+    use ct_core::{CorrectionStatus, DisplayMode, ExplanationResult};
     use ct_llm::MockProvider;
     use ct_win::chrome::{CapturedText, ReplaceError};
 
@@ -641,6 +664,7 @@ mod tests {
             replace: Box::new(NoCapture(log.clone())),
             view_only: Box::new(NoCapture(log.clone())),
             docs_or_slides: Box::new(|| false),
+            modifiers_released: Box::new(|| true),
             badge: recorder.clone(),
             notifier: recorder.clone(),
             view: recorder,
@@ -671,14 +695,6 @@ mod tests {
                 format!("notify:{MSG_TRANSLATE_FAILED}")
             ]
         );
-        a.on_panic(Gesture::CtrlHeldAltAlt);
-        assert_eq!(
-            take(&log),
-            vec![
-                "badge.hide".to_string(),
-                format!("notify:{MSG_TRANSLATE_FAILED}")
-            ]
-        );
     }
 
     #[test]
@@ -687,8 +703,57 @@ mod tests {
         let a = action(&log);
         a.on_panic(Gesture::CtrlCtrl);
         assert_eq!(take(&log), vec![format!("view.error:{MSG_EXPLAIN_FAILED}")]);
+    }
+
+    #[test]
+    fn on_panic_correction_gestures_show_correction_failed() {
+        let log = Log::default();
+        let a = action(&log);
+        a.on_panic(Gesture::CtrlHeldAltAlt);
+        assert_eq!(
+            take(&log),
+            vec![
+                "badge.hide".to_string(),
+                format!("notify:{MSG_CORRECTION_FAILED}")
+            ]
+        );
         a.on_panic(Gesture::AltHeldCtrlCtrl);
-        assert_eq!(take(&log), vec![format!("view.error:{MSG_EXPLAIN_FAILED}")]);
+        assert_eq!(
+            take(&log),
+            vec![format!("view.error:{MSG_CORRECTION_FAILED}")]
+        );
+    }
+
+    #[test]
+    fn correction_failed_constant_matches_core_message() {
+        assert_eq!(
+            MSG_CORRECTION_FAILED,
+            CorrectionStatus::LlmFailed.user_message()
+        );
+    }
+
+    #[test]
+    fn run_routes_correction_gestures_to_correction_flows() {
+        let log = Log::default();
+        let a = action(&log);
+        a.run(Gesture::CtrlHeldAltAlt, snapshot());
+        assert_eq!(
+            take(&log),
+            vec![
+                "badge.show".to_string(),
+                "capture".to_string(),
+                "badge.hide".to_string(),
+                format!("notify:{MSG_CORRECTION_REPLACE_NO_SELECTION}")
+            ]
+        );
+        a.run(Gesture::AltHeldCtrlCtrl, snapshot());
+        assert_eq!(
+            take(&log),
+            vec![
+                "capture".to_string(),
+                format!("view.error:{MSG_CORRECTION_VIEW_NO_SELECTION}")
+            ]
+        );
     }
 
     #[test]
@@ -703,10 +768,6 @@ mod tests {
         let got = take(&log);
         assert_eq!(got[0], "capture");
         assert!(got[1].starts_with("view.error:"), "{got:?}");
-        // Chords are not handled in this version: no capture, no UI.
-        a.run(Gesture::CtrlHeldAltAlt, snapshot());
-        a.run(Gesture::AltHeldCtrlCtrl, snapshot());
-        assert!(take(&log).is_empty());
     }
 
     #[test]
