@@ -40,8 +40,13 @@ export component ExplainWin inherits Window {
     in property <string> table-caption;
     in property <[string]> col-headers;
     in property <[SheetRow]> table-rows;
-    // Table geometry (S-ref 7.2): fixed 220 px columns, 28 px minimum row height.
+    // Table geometry: 220 px is the minimum (and initial-size) column width, 28 px the
+    // minimum row height. Columns stretch to share the visible width and follow resizes;
+    // below the minimum the table scrolls horizontally.
     out property <length> table-width: 40px + root.col-headers.length * 220px;
+    property <length> col-width: root.col-headers.length == 0 ? 220px
+        : max(220px, (tv.visible-width - 40px) / root.col-headers.length);
+    property <length> laid-width: 40px + root.col-headers.length * root.col-width;
     out property <length> content-width: root.has-table ? root.table-width : column.preferred-width;
     out property <length> content-height: root.has-table ? tcol.preferred-height : column.preferred-height;
     callback close-requested();
@@ -126,10 +131,10 @@ export component ExplainWin inherits Window {
                     visible: root.has-table;
                     max-height: root.has-table ? 100000px : 0px;
                     vertical-stretch: 1;
-                    content-width: root.table-width;
+                    content-width: root.laid-width;
                     content-height: tcol.preferred-height;
                     tcol := VerticalLayout {
-                        width: root.table-width;
+                        width: root.laid-width;
                         alignment: start;
                         if root.table-caption != "": Text {
                             text: root.table-caption;
@@ -146,7 +151,7 @@ export component ExplainWin inherits Window {
                             }
 
                             for h in root.col-headers: Rectangle {
-                                width: 220px;
+                                width: root.col-width;
                                 background: #F1E4E1;
                                 Text {
                                     text: h;
@@ -172,7 +177,7 @@ export component ExplainWin inherits Window {
                             }
 
                             for cell in row.cells: Rectangle {
-                                width: 220px;
+                                width: root.col-width;
                                 background: #FFFFFF;
                                 border-width: 1px;
                                 border-color: #E6D5D1;

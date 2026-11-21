@@ -198,10 +198,19 @@ pub fn table_state(table: &SheetsTable) -> ExplainViewState {
     }
 }
 
-/// Table window size: `content + (60, 130)` clamped like `fit_size` (S-ref 7.2-7).
+/// Widest initial table window; wider than text results so many columns fit.
+const TABLE_MAX_W: f32 = 1200.0;
+
+/// Table window size: `content + (60, 130)` (S-ref 7.2-7), width clamped to
+/// `min(TABLE_MAX_W, avail.w - 40)`, height clamped like `fit_size`.
 pub fn table_size(content: (f32, f32), avail: Option<(f32, f32)>) -> (f32, f32) {
-    // `fit_size` adds (40, 80); top up to (60, 130).
-    fit_size((content.0 + 20.0, content.1 + 50.0), avail)
+    let max_w = match avail {
+        Some((w, _)) => TABLE_MAX_W.min(w - 40.0).max(MIN_W),
+        None => TABLE_MAX_W,
+    };
+    // `fit_size` adds (40, 80); top up to (60, 130). Only its height is used.
+    let (_, height) = fit_size((content.0 + 20.0, content.1 + 50.0), avail);
+    ((content.0 + 60.0).clamp(MIN_W, max_w), height)
 }
 
 pub fn loading_state(text: &str) -> ExplainViewState {
@@ -962,11 +971,14 @@ mod tests {
         let avail = Some((1920.0, 1040.0));
         assert_eq!(table_size((10.0, 10.0), avail), (480.0, 240.0));
         assert_eq!(table_size((500.0, 300.0), avail), (560.0, 430.0));
-        assert_eq!(table_size((5000.0, 5000.0), avail), (700.0, 800.0));
+        // Wide tables may open up to 1200 px (screen permitting); height keeps the 800 cap.
+        assert_eq!(table_size((5000.0, 5000.0), avail), (1200.0, 800.0));
+        assert_eq!(table_size((900.0, 300.0), avail), (960.0, 430.0));
         assert_eq!(
             table_size((5000.0, 5000.0), Some((600.0, 500.0))),
             (560.0, 420.0)
         );
+        assert_eq!(table_size((5000.0, 300.0), None), (1200.0, 430.0));
         assert_eq!(table_size((500.0, 300.0), None), (560.0, 430.0));
     }
 
