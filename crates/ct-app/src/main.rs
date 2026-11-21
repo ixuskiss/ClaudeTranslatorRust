@@ -38,7 +38,9 @@ use ct_win::chrome::{
 };
 use ct_win::clipboard::{Clipboard, Win32Clipboard};
 use ct_win::hotkey::{ChordRouter, Gesture, KeyboardHook};
-use ct_win::keys::{KeySender, Win32KeySender, wait_for_modifiers_released};
+use ct_win::keys::{
+    KeySender, MODIFIER_RELEASE_TIMEOUT, Win32KeySender, wait_for_modifiers_released,
+};
 use ct_win::registry::apply_autostart;
 use ct_win::single_instance::{ALREADY_RUNNING_MESSAGE, SINGLE_INSTANCE_NAME, SingleInstance};
 
@@ -51,8 +53,6 @@ const MODELS_CACHE_FILE: &str = "models_cache.json";
 const TRAY_POLL: Duration = Duration::from_millis(50);
 /// How long Exit waits for the CLI process to be closed before leaving anyway.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
-/// How long a correction gesture waits for the held modifier keys to be released.
-const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Autostart is written only by release builds (P7).
 const IS_RELEASE: bool = cfg!(not(debug_assertions));
 

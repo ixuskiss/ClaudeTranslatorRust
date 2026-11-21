@@ -24,7 +24,9 @@
   - `PostThreadMessageW`와 `UnhookWindowsHookEx`의 결과를 무시한다.
   - `GetMessageW`가 -1을 돌려줘도 참으로 처리한다.
   - `handle_event` 연결 코드에 테스트가 없다.
-- **키 전송**: `SendInput`이 일부만 성공하면 Ctrl이 눌린 채로 남을 수 있다.
+- **키 전송**
+  - `SendInput`이 일부만 성공하면 Ctrl이 눌린 채로 남을 수 있다.
+  - 교체(붙여넣기) 직전에는 Alt만 최대 0.5초 기다리고 Ctrl은 보지 않는다. LLM 응답을 기다리는 동안 사용자가 다른 단축키를 누르고 있으면 Ctrl+A/Ctrl+V가 수정키와 섞여 나갈 수 있다. 붙여넣기 전에 `wait_for_modifiers_released`로 Ctrl·Alt를 모두 확인하고, 시간이 지나면 교체를 취소한다(계획 3 최종 리뷰).
 - **CLI**
   - stderr 읽기 스레드를 띄우지 못하면 파이프가 닫힌다.
   - 프로세스를 띄운 뒤 Job에 넣기 전 짧은 틈에 생긴 손자 프로세스는 Job을 빠져나간다.
