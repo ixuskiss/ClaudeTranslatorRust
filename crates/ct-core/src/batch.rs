@@ -6,13 +6,15 @@ use crate::compose::compose_replacement;
 use crate::config::SheetsConfig;
 use crate::detector::LanguageDetector;
 use crate::dictionary::{
-    DictionaryEntry, MaskMatch, mask, renumber, restore, validate_integrity,
+    DictionaryEntry, MaskMatch, mask, renumber, restore, restore_fragment, validate_integrity,
     validate_integrity_across,
 };
 use crate::lang::Lang;
-use crate::llm::{BatchItem, BatchTranslationRequest, LlmProvider};
+use crate::llm::{
+    BatchCorrectionItem, BatchCorrectionRequest, BatchItem, BatchTranslationRequest, LlmProvider,
+};
 use crate::plan::resolve_plan;
-use crate::settings::Tone;
+use crate::settings::{CorrectionMode, Tone};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -97,6 +99,44 @@ fn align_languages(destinations: &[Lang], texts: Vec<(Lang, String)>) -> Option<
         out.push((*lang, text.clone()));
     }
     Some(out)
+}
+
+/// Runs planned batches in order: the job timeout is checked before each one, every response
+/// must carry exactly the requested ids, and `accept` validates one item's payload (`None` is
+/// an id mismatch). Returns the accepted payloads in item order.
+fn run_planned<T, U>(
+    planned: Vec<Vec<usize>>,
+    ids: &[&str],
+    limits: &BatchLimits,
+    elapsed: &dyn Fn() -> Duration,
+    batch_count: &mut usize,
+    mut send: impl FnMut(&[usize]) -> Result<Vec<(String, T)>, BatchFailure>,
+    accept: impl Fn(usize, T) -> Option<U>,
+) -> Result<Vec<U>, BatchFailure> {
+    let mut raw: Vec<Option<U>> = ids.iter().map(|_| None).collect();
+    for batch in planned {
+        if elapsed() > limits.job_timeout {
+            return Err(BatchFailure::Timeout);
+        }
+        *batch_count += 1;
+        let items = send(&batch)?;
+        if items.len() != batch.len() {
+            return Err(ids_mismatch());
+        }
+        let mut by_id: HashMap<String, T> = HashMap::new();
+        for (id, payload) in items {
+            if by_id.insert(id, payload).is_some() {
+                return Err(ids_mismatch());
+            }
+        }
+        for &i in &batch {
+            let payload = by_id.remove(ids[i]).ok_or_else(ids_mismatch)?;
+            raw[i] = Some(accept(i, payload).ok_or_else(ids_mismatch)?);
+        }
+    }
+    raw.into_iter()
+        .map(|r| r.ok_or_else(ids_mismatch))
+        .collect()
 }
 
 struct Prepared {
@@ -241,37 +281,26 @@ fn run_translate_cells(
         prepared.iter().map(|p| p.size).enumerate().collect(),
         limits,
     );
-    let mut raw: Vec<Option<LangTexts>> = vec![None; prepared.len()];
-    for batch in planned {
-        if elapsed() > limits.job_timeout {
-            return Err(BatchFailure::Timeout);
-        }
-        *batch_count += 1;
-        let request = BatchTranslationRequest {
-            items: batch.iter().map(|&i| prepared[i].item.clone()).collect(),
-            tone,
-        };
-        let response = llm
-            .translate_batch(&request)
-            .map_err(|e| BatchFailure::Llm(e.0))?;
-        if response.items.len() != batch.len() {
-            return Err(ids_mismatch());
-        }
-        let mut by_id: HashMap<String, LangTexts> = HashMap::new();
-        for (id, texts) in response.items {
-            if by_id.insert(id, texts).is_some() {
-                return Err(ids_mismatch());
-            }
-        }
-        for &i in &batch {
-            let p = &prepared[i];
-            let texts = by_id.remove(&p.item.id).ok_or_else(ids_mismatch)?;
-            raw[i] = Some(align_languages(&p.item.destinations, texts).ok_or_else(ids_mismatch)?);
-        }
-    }
+    let ids: Vec<&str> = prepared.iter().map(|p| p.item.id.as_str()).collect();
+    let raw = run_planned(
+        planned,
+        &ids,
+        limits,
+        elapsed,
+        batch_count,
+        |batch| {
+            let request = BatchTranslationRequest {
+                items: batch.iter().map(|&i| prepared[i].item.clone()).collect(),
+                tone,
+            };
+            llm.translate_batch(&request)
+                .map(|r| r.items)
+                .map_err(|e| BatchFailure::Llm(e.0))
+        },
+        |i, texts| align_languages(&prepared[i].item.destinations, texts),
+    )?;
     let mut out = Vec::with_capacity(prepared.len());
     for (p, texts) in prepared.iter().zip(raw) {
-        let texts = texts.ok_or_else(ids_mismatch)?;
         let mut restored = Vec::with_capacity(texts.len());
         for (lang, text) in texts {
             let intact = validate_integrity(&p.mapping, &text)
@@ -308,12 +337,164 @@ pub fn compose_cell_replacements(
     Ok(out)
 }
 
+/// Equal ignoring outer whitespace keeps the original; otherwise the original's outer
+/// whitespace wraps the trimmed correction.
+fn merge_whitespace(original: &str, restored: &str) -> String {
+    let core = restored.trim();
+    if original.trim() == core {
+        return original.to_string();
+    }
+    let lead_len = original.len() - original.trim_start().len();
+    let trail_start = original.trim_end().len().max(lead_len);
+    format!(
+        "{}{core}{}",
+        &original[..lead_len],
+        &original[trail_start..]
+    )
+}
+
+struct PreparedCorrection {
+    key: CellKey,
+    original: String,
+    mapping: Vec<MaskMatch>,
+    item: BatchCorrectionItem,
+}
+
+/// Corrects Korean cells in size-limited batches. Only Korean cells are sent (ids `c{n}` count
+/// sent cells) and returned, unchanged ones with their original text. All-or-nothing.
+pub fn correct_cells(
+    cells: &[CellText],
+    entries: &[DictionaryEntry],
+    detector: &dyn LanguageDetector,
+    llm: &dyn LlmProvider,
+    mode: CorrectionMode,
+    limits: &BatchLimits,
+    elapsed: &dyn Fn() -> Duration,
+) -> Result<Vec<(CellKey, String)>, BatchFailure> {
+    let started = Instant::now();
+    let mut batches = 0usize;
+    let result = run_correct_cells(
+        cells,
+        entries,
+        detector,
+        llm,
+        mode,
+        limits,
+        elapsed,
+        &mut batches,
+    );
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::info!(
+            operation = "batch_correct",
+            cells = cells.len(),
+            batches,
+            elapsed_ms,
+            "ok"
+        ),
+        Err(e) => tracing::warn!(
+            operation = "batch_correct",
+            cells = cells.len(),
+            batches,
+            elapsed_ms,
+            failure = failure_kind(e),
+            "failed"
+        ),
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_correct_cells(
+    cells: &[CellText],
+    entries: &[DictionaryEntry],
+    detector: &dyn LanguageDetector,
+    llm: &dyn LlmProvider,
+    mode: CorrectionMode,
+    limits: &BatchLimits,
+    elapsed: &dyn Fn() -> Duration,
+    batch_count: &mut usize,
+) -> Result<Vec<(CellKey, String)>, BatchFailure> {
+    let mut prepared: Vec<PreparedCorrection> = Vec::new();
+    let mut offset = 0usize;
+    for cell in cells {
+        let masked = mask(&cell.text, entries);
+        if detector.detect(&masked.masked_text) != Some(Lang::Ko) {
+            continue;
+        }
+        let masked = renumber(masked, offset);
+        offset += masked.mapping.len();
+        if masked.masked_text.chars().count() > limits.max_cell_chars {
+            return Err(BatchFailure::CellTooLarge);
+        }
+        prepared.push(PreparedCorrection {
+            key: cell.key,
+            original: cell.text.clone(),
+            mapping: masked.mapping,
+            item: BatchCorrectionItem {
+                id: format!("c{}", prepared.len()),
+                text: masked.masked_text,
+            },
+        });
+    }
+    if prepared.is_empty() {
+        return Err(BatchFailure::NoKoreanText);
+    }
+    let planned = plan_batches(
+        prepared
+            .iter()
+            .map(|p| p.item.text.chars().count())
+            .enumerate()
+            .collect(),
+        limits,
+    );
+    let ids: Vec<&str> = prepared.iter().map(|p| p.item.id.as_str()).collect();
+    let texts = run_planned(
+        planned,
+        &ids,
+        limits,
+        elapsed,
+        batch_count,
+        |batch| {
+            let request = BatchCorrectionRequest {
+                items: batch.iter().map(|&i| prepared[i].item.clone()).collect(),
+                mode,
+            };
+            llm.correct_batch(&request)
+                .map(|r| r.items)
+                .map_err(|e| BatchFailure::Llm(e.0))
+        },
+        |_, text: String| Some(text),
+    )?;
+    let mut out = Vec::with_capacity(prepared.len());
+    for (p, text) in prepared.iter().zip(texts) {
+        if text.trim().is_empty() {
+            return Err(BatchFailure::Llm("empty correction result".to_string()));
+        }
+        let intact = validate_integrity(&p.mapping, &text)
+            && validate_integrity_across(&p.mapping, &[text.as_str()]);
+        if !intact {
+            return Err(BatchFailure::Integrity);
+        }
+        let restored =
+            restore_fragment(&text, &p.mapping, None).map_err(|_| BatchFailure::Integrity)?;
+        if restored.trim().is_empty() {
+            return Err(BatchFailure::Llm("empty correction result".to_string()));
+        }
+        out.push((p.key, merge_whitespace(&p.original, &restored)));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::detector::RuleBasedDetector;
     use crate::dictionary::Action;
-    use crate::llm::{BatchTranslationRequest, BatchTranslationResult, LlmError};
+    use crate::llm::{
+        BatchCorrectionResult, BatchTranslationRequest, BatchTranslationResult, LlmError,
+    };
+    use crate::settings::CorrectionMode;
     use crate::test_support::FakeLlm;
     use std::cell::Cell;
 
@@ -773,7 +954,6 @@ mod tests {
     #[test]
     fn default_provider_batch_methods_are_unsupported() {
         use crate::llm::{BatchCorrectionRequest, LlmProvider};
-        use crate::settings::CorrectionMode;
         struct Bare;
         impl LlmProvider for Bare {
             fn translate(
@@ -816,6 +996,217 @@ mod tests {
             c,
             Err(LlmError("correction not supported by this provider".into()))
         );
+    }
+
+    fn echo_corr() -> FakeLlm {
+        let f = FakeLlm::new();
+        f.set_correct_responder(FakeLlm::echo_correct_responder());
+        f
+    }
+    fn fixed(items: &[(&str, &str)]) -> FakeLlm {
+        let f = FakeLlm::new();
+        f.push_correct_batch(Ok(BatchCorrectionResult {
+            items: items
+                .iter()
+                .map(|(i, t)| (i.to_string(), t.to_string()))
+                .collect(),
+        }));
+        f
+    }
+    fn correct(
+        cells: &[CellText],
+        entries: &[DictionaryEntry],
+        llm: &FakeLlm,
+        lim: &BatchLimits,
+    ) -> Result<Vec<(CellKey, String)>, BatchFailure> {
+        correct_cells(
+            cells,
+            entries,
+            &RuleBasedDetector,
+            llm,
+            CorrectionMode::Spelling,
+            lim,
+            &no_time,
+        )
+    }
+
+    #[test]
+    fn correction_sends_and_returns_only_korean_cells() {
+        let llm = echo_corr();
+        let out = correct(
+            &[cell(0, 0, "확인햇다"), cell(0, 1, "Hello")],
+            &[],
+            &llm,
+            &limits(),
+        )
+        .unwrap();
+        let reqs = llm.correct_batch_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].items.len(), 1);
+        assert_eq!(reqs[0].items[0].id, "c0");
+        assert_eq!(reqs[0].mode, CorrectionMode::Spelling);
+        assert_eq!(out, vec![((0, 0), "[교정] 확인햇다".to_string())]);
+    }
+
+    #[test]
+    fn correction_ids_count_sent_cells_only() {
+        let llm = echo_corr();
+        correct(
+            &[
+                cell(0, 0, "Hello"),
+                cell(0, 1, "확인햇다"),
+                cell(0, 2, "안녕"),
+            ],
+            &[],
+            &llm,
+            &limits(),
+        )
+        .unwrap();
+        let ids: Vec<String> = llm.correct_batch_requests()[0]
+            .items
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["c0", "c1"]);
+    }
+
+    #[test]
+    fn correction_without_korean_cells_is_no_korean_text() {
+        let llm = echo_corr();
+        let out = correct(&[cell(0, 0, "Hello")], &[], &llm, &limits());
+        assert_eq!(out, Err(BatchFailure::NoKoreanText));
+        assert_eq!(llm.correct_batch_calls(), 0);
+        let out = correct(&[], &[], &llm, &limits());
+        assert_eq!(out, Err(BatchFailure::NoKoreanText));
+    }
+
+    #[test]
+    fn correction_keeps_translate_terms_as_written() {
+        let llm = echo_corr();
+        let out = correct(
+            &[cell(0, 0, "logical model 확인")],
+            &[logical_model()],
+            &llm,
+            &limits(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![((0, 0), "[교정] logical model 확인".to_string())]);
+    }
+
+    #[test]
+    fn correction_token_moved_to_other_cell_is_integrity_failure() {
+        let llm = fixed(&[("c0", "확인"), ("c1", "⟦0⟧ 확인")]);
+        let out = correct(
+            &[cell(0, 0, "DA 확인"), cell(0, 1, "확인햇다")],
+            &[keep("DA")],
+            &llm,
+            &limits(),
+        );
+        assert_eq!(out, Err(BatchFailure::Integrity));
+    }
+
+    #[test]
+    fn correction_preserves_outer_whitespace_per_cell() {
+        let llm = fixed(&[("c0", "  확인했다  ")]);
+        let out = correct(&[cell(0, 0, " 확인햇다\n")], &[], &llm, &limits()).unwrap();
+        assert_eq!(out, vec![((0, 0), " 확인했다\n".to_string())]);
+    }
+
+    #[test]
+    fn correction_equal_ignoring_outer_whitespace_keeps_original() {
+        let llm = fixed(&[("c0", "확인")]);
+        let out = correct(&[cell(0, 0, "  확인\t")], &[], &llm, &limits()).unwrap();
+        assert_eq!(out, vec![((0, 0), "  확인\t".to_string())]);
+    }
+
+    #[test]
+    fn correction_blank_result_is_llm_failure() {
+        let llm = fixed(&[("c0", "   ")]);
+        let out = correct(&[cell(0, 0, "확인햇다")], &[], &llm, &limits());
+        assert!(matches!(out, Err(BatchFailure::Llm(_))));
+    }
+
+    #[test]
+    fn correction_llm_error_and_cell_too_large_fail() {
+        let llm = FakeLlm::new();
+        llm.push_correct_batch(Err(LlmError("boom".into())));
+        let out = correct(&[cell(0, 0, "확인햇다")], &[], &llm, &limits());
+        assert_eq!(out, Err(BatchFailure::Llm("boom".into())));
+        let tiny = BatchLimits {
+            max_cells: 5,
+            max_chars: 100,
+            max_cell_chars: 3,
+            job_timeout: Duration::from_secs(60),
+        };
+        let llm = echo_corr();
+        let out = correct(&[cell(0, 0, "확인햇다")], &[], &llm, &tiny);
+        assert_eq!(out, Err(BatchFailure::CellTooLarge));
+        assert_eq!(llm.correct_batch_calls(), 0);
+    }
+
+    #[test]
+    fn correction_id_mismatch_and_timeout_reuse_batch_checks() {
+        let llm = fixed(&[("c0", "a")]);
+        let out = correct(
+            &[cell(0, 0, "확인햇다"), cell(0, 1, "안녕")],
+            &[],
+            &llm,
+            &limits(),
+        );
+        assert_eq!(
+            out,
+            Err(BatchFailure::Llm(
+                "response ids do not match request".into()
+            ))
+        );
+        let lim = BatchLimits {
+            max_cells: 1,
+            max_chars: 10_000,
+            max_cell_chars: 5_000,
+            job_timeout: Duration::from_secs(150),
+        };
+        let ticks = Cell::new(0u64);
+        let elapsed = || {
+            ticks.set(ticks.get() + 100);
+            Duration::from_secs(ticks.get())
+        };
+        let llm = echo_corr();
+        let cells: Vec<CellText> = (0..3).map(|r| cell(r, 0, "안녕")).collect();
+        let out = correct_cells(
+            &cells,
+            &[],
+            &RuleBasedDetector,
+            &llm,
+            CorrectionMode::Spelling,
+            &lim,
+            &elapsed,
+        );
+        assert_eq!(out, Err(BatchFailure::Timeout));
+        assert_eq!(llm.correct_batch_calls(), 1);
+    }
+
+    #[test]
+    fn correction_batch_size_ignores_destinations() {
+        // 4 chars each, max_chars 8: two per batch, the third starts a new one.
+        let lim = BatchLimits {
+            max_cells: 50,
+            max_chars: 8,
+            max_cell_chars: 5_000,
+            job_timeout: Duration::from_secs(60),
+        };
+        let llm = echo_corr();
+        let cells: Vec<CellText> = (0..3).map(|r| cell(r, 0, "안녕하세")).collect();
+        correct(&cells, &[], &llm, &lim).unwrap();
+        assert_eq!(llm.correct_batch_calls(), 2);
+    }
+
+    #[test]
+    fn merge_whitespace_handles_multibyte_and_edges() {
+        assert_eq!(
+            merge_whitespace("\n 확인햇다 \t", "확인했다"),
+            "\n 확인했다 \t"
+        );
+        assert_eq!(merge_whitespace("확인햇다", " 확인했다 "), "확인했다");
     }
 
     #[test]

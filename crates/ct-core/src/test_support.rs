@@ -20,11 +20,16 @@ pub(crate) struct FakeLlm {
     translate_batch: Mutex<Script<BatchTranslationRequest, BatchTranslationResult>>,
     correct_batch: Mutex<Script<BatchCorrectionRequest, BatchCorrectionResult>>,
     batch_responder: Mutex<Option<BatchResponder>>,
+    correct_responder: Mutex<Option<CorrectBatchResponder>>,
 }
 
 /// Computes a batch translation reply from the request when no scripted reply is queued.
 pub(crate) type BatchResponder =
     Box<dyn Fn(&BatchTranslationRequest) -> Result<BatchTranslationResult, LlmError> + Send + Sync>;
+
+/// Computes a batch correction reply from the request when no scripted reply is queued.
+pub(crate) type CorrectBatchResponder =
+    Box<dyn Fn(&BatchCorrectionRequest) -> Result<BatchCorrectionResult, LlmError> + Send + Sync>;
 
 struct Script<Req, Res> {
     responses: VecDeque<Result<Res, LlmError>>,
@@ -128,6 +133,25 @@ impl FakeLlm {
         self
     }
 
+    /// Replies to every unscripted `correct_batch` call by computing from the request.
+    pub(crate) fn set_correct_responder(&self, r: CorrectBatchResponder) -> &Self {
+        *lock(&self.correct_responder) = Some(r);
+        self
+    }
+
+    /// Responder that answers each item with `"[교정] <text>"`.
+    pub(crate) fn echo_correct_responder() -> CorrectBatchResponder {
+        Box::new(|req| {
+            Ok(BatchCorrectionResult {
+                items: req
+                    .items
+                    .iter()
+                    .map(|i| (i.id.clone(), format!("[교정] {}", i.text)))
+                    .collect(),
+            })
+        })
+    }
+
     /// Responder that answers each item with `"[<lang>] <text>"` per destination.
     pub(crate) fn echo_batch_responder() -> BatchResponder {
         Box::new(|req| {
@@ -187,7 +211,18 @@ impl LlmProvider for FakeLlm {
         &self,
         req: &BatchCorrectionRequest,
     ) -> Result<BatchCorrectionResult, LlmError> {
-        call(&self.correct_batch, req)
+        let queued = {
+            let mut s = lock(&self.correct_batch);
+            s.requests.push(req.clone());
+            s.responses.pop_front()
+        };
+        if let Some(r) = queued {
+            return r;
+        }
+        match lock(&self.correct_responder).as_ref() {
+            Some(f) => f(req),
+            None => Err(LlmError("FakeLlm: no response queued".into())),
+        }
     }
 }
 
