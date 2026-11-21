@@ -8,3 +8,4 @@ rust-version.workspace = true
 ct-core = { path = "../ct-core" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

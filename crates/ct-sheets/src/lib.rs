@@ -9,6 +9,7 @@ pub mod model;
 pub mod outcome;
 pub mod payload;
 pub mod routing;
+pub mod service;
 pub mod support;
 pub mod verify;
 
@@ -28,6 +29,10 @@ pub use payload::{PayloadError, build_replacement_html, native_payload};
 pub use routing::{
     Route, SheetsInputState, SheetsRole, SheetsRouting, choose_route, input_state_from_role,
     is_google_sheets_url, parse_sheets_url, route_of,
+};
+pub use service::{
+    CaptureError, SheetsInteraction, TableResults, Transform, capture_for_table,
+    correction_failure, replace_cells, table_from, translation_failure,
 };
 pub use support::{
     ParsedAddress, SheetsMode, check_range_support, column_letters, parse_range_address,

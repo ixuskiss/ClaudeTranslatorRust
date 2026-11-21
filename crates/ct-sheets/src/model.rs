@@ -1,8 +1,7 @@
 //! Data model of a captured Sheets range.
 
 /// `(row, col)` inside the selected range, 0-based.
-// TODO(plan4): a later task replaces this with a re-export from ct-core.
-pub type CellKey = (usize, usize);
+pub use ct_core::CellKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellKind {
