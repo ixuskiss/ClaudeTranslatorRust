@@ -6,9 +6,9 @@
 use std::time::Instant;
 
 use ct_core::{
-    CorrectionSentence, DICTIONARY_INTEGRITY_MESSAGE, DictionaryEntry, DisplayMode,
-    ExplanationResult, LanguageDetector, LlmProvider, TranslateError, UserSettings, explain_text,
-    translate_text,
+    CorrectionOutcome, CorrectionSentence, CorrectionStatus, DICTIONARY_INTEGRITY_MESSAGE,
+    DictionaryEntry, DisplayMode, ExplanationResult, Lang, LanguageDetector, LlmProvider,
+    TranslateError, UserSettings, correct_sentences, correct_text, explain_text, translate_text,
 };
 use ct_llm::CLI_START_FAILURE_MARKER;
 use ct_win::chrome::{ReplaceError, TextInteraction};
@@ -21,6 +21,10 @@ pub const MSG_CTRL_NO_SELECTION: &str = "텍스트를 선택한 후 Ctrl+Ctrl을
 pub const MSG_EXPLAIN_FAILED: &str = "Could not translate/explain the selected text";
 pub const MSG_CLI_UNAVAILABLE: &str =
     "Claude CLI를 실행할 수 없습니다. Settings의 Claude CLI 경로를 확인하세요.";
+pub const MSG_CORRECTION_REPLACE_NO_SELECTION: &str =
+    "텍스트를 선택한 후 Ctrl+Alt+Alt를 눌러주세요.";
+pub const MSG_CORRECTION_VIEW_NO_SELECTION: &str =
+    "텍스트를 선택한 후 Alt+Ctrl+Ctrl을 실행해주세요.";
 
 const LOADING_TEXT: &str = "Translating...";
 
@@ -195,6 +199,129 @@ pub fn ctrl_ctrl_flow(d: &FlowDeps, ti: &dyn TextInteraction, view: &dyn Explain
             view.show_error(MSG_CLI_UNAVAILABLE)
         }
         Err(_) => view.show_error(MSG_EXPLAIN_FAILED),
+    }
+}
+
+/// User-facing text for a non-success correction outcome.
+fn correction_message(o: &CorrectionOutcome) -> &'static str {
+    match (&o.status, &o.llm_error) {
+        (CorrectionStatus::LlmFailed, Some(m)) if is_cli_start_failure(m) => MSG_CLI_UNAVAILABLE,
+        _ => o.status.user_message(),
+    }
+}
+
+/// Work done while the badge is visible; the user message (if any) is sent after the
+/// badge is hidden.
+fn correction_replace_work(d: &FlowDeps, ti: &dyn TextInteraction) -> Option<&'static str> {
+    let Some(captured) = ti.capture() else {
+        tracing::info!(operation = "correction_replace", status = "capture_failed");
+        return Some(MSG_CORRECTION_REPLACE_NO_SELECTION);
+    };
+    let s = d.settings;
+    let outcome = correct_text(
+        &captured.context.text,
+        s.base_language,
+        s.korean_correction_mode,
+        d.entries,
+        d.detector,
+        d.llm,
+    );
+    let corrected = match (&outcome.status, outcome.corrected_text.as_deref()) {
+        (CorrectionStatus::Success, Some(c)) => c,
+        _ => return Some(correction_message(&outcome)),
+    };
+    match ti.replace(&captured, corrected) {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(
+                operation = "correction_replace",
+                status = "replace_failed",
+                error = replace_error_kind(&e)
+            );
+            Some(MSG_REPLACE_FAILED)
+        }
+    }
+}
+
+/// Ctrl+Alt+Alt: correct the selection and replace it. `modifiers_released` waits (up to
+/// 2 seconds) until Ctrl and Alt are both up and reports whether they were.
+pub fn correction_replace_flow(
+    d: &FlowDeps,
+    ti: &dyn TextInteraction,
+    modifiers_released: &dyn Fn() -> bool,
+    badge: &dyn Badge,
+    notifier: &dyn Notifier,
+) {
+    let started = Instant::now();
+    if d.settings.base_language != Lang::Ko {
+        notifier.notify(CorrectionStatus::BaseNotKorean.user_message());
+        return;
+    }
+    if !modifiers_released() {
+        tracing::info!(operation = "correction_replace", status = "modifiers_held");
+        notifier.notify(MSG_CORRECTION_REPLACE_NO_SELECTION);
+        return;
+    }
+    badge.show(d.settings.korean_correction_mode.loading_message());
+    let message = {
+        let _guard = BadgeGuard(badge);
+        correction_replace_work(d, ti)
+    };
+    tracing::info!(
+        operation = "correction_replace",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        notified = message.is_some(),
+        "done"
+    );
+    if let Some(m) = message {
+        notifier.notify(m);
+    }
+}
+
+/// Alt+Ctrl+Ctrl: correct the selection and show the result in the explanation window.
+pub fn correction_view_flow(
+    d: &FlowDeps,
+    ti: &dyn TextInteraction,
+    modifiers_released: &dyn Fn() -> bool,
+    view: &dyn ExplainView,
+) {
+    let started = Instant::now();
+    let s = d.settings;
+    if s.base_language != Lang::Ko {
+        view.show_error(CorrectionStatus::BaseNotKorean.user_message());
+        return;
+    }
+    if !modifiers_released() {
+        tracing::info!(operation = "correction_view", status = "modifiers_held");
+        view.show_error(MSG_CORRECTION_VIEW_NO_SELECTION);
+        return;
+    }
+    // Capture first: showing the window before capture would steal focus from the target.
+    let Some(captured) = ti.capture() else {
+        tracing::info!(operation = "correction_view", status = "capture_failed");
+        view.show_error(MSG_CORRECTION_VIEW_NO_SELECTION);
+        return;
+    };
+    view.show_loading(s.korean_correction_mode.loading_message());
+    let outcome = correct_sentences(
+        &captured.context.text,
+        s.base_language,
+        s.korean_correction_mode,
+        d.entries,
+        d.detector,
+        d.llm,
+    );
+    tracing::info!(
+        operation = "correction_view",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        status = ?outcome.status,
+        "done"
+    );
+    match (outcome.status, outcome.sentences.clone()) {
+        (CorrectionStatus::Success, Some(sentences)) => {
+            view.show_correction(sentences, s.ctrl_ctrl_display_mode)
+        }
+        _ => view.show_error(correction_message(&outcome)),
     }
 }
 
@@ -648,5 +775,390 @@ mod tests {
         s.ctrl_ctrl_display_mode = DisplayMode::PerSentence;
         let log = run_ctrl(&s, LlmMode::Ok, Some("안녕"), &[]);
         assert_eq!(log.last().map(String::as_str), Some("result:1:PerSentence"));
+    }
+
+    // ---- Korean correction flows ----
+
+    struct CorrLlm {
+        single: Result<String, String>,
+        sentences: Result<Vec<CorrectionSentence>, String>,
+    }
+
+    impl CorrLlm {
+        fn ok() -> Self {
+            CorrLlm {
+                single: Ok("안녕하세요".into()),
+                sentences: Ok(vec![CorrectionSentence {
+                    original: "안녕 하세요".into(),
+                    corrected: "안녕하세요".into(),
+                }]),
+            }
+        }
+        fn failing(msg: &str) -> Self {
+            CorrLlm {
+                single: Err(msg.into()),
+                sentences: Err(msg.into()),
+            }
+        }
+    }
+
+    impl LlmProvider for CorrLlm {
+        fn translate(&self, _: &TranslationRequest) -> Result<TranslationResult, LlmError> {
+            Err(LlmError("unused".into()))
+        }
+        fn explain(&self, _: &ExplanationRequest) -> Result<ExplanationResult, LlmError> {
+            Err(LlmError("unused".into()))
+        }
+        fn correct(&self, _: &CorrectionRequest) -> Result<String, LlmError> {
+            self.single.clone().map_err(LlmError)
+        }
+        fn correct_sentences(
+            &self,
+            _: &CorrectionRequest,
+        ) -> Result<Vec<CorrectionSentence>, LlmError> {
+            self.sentences.clone().map_err(LlmError)
+        }
+    }
+
+    fn run_replace(
+        s: &UserSettings,
+        llm: &CorrLlm,
+        text: Option<&str>,
+        replace_fails: bool,
+        released: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        let log: Log = Default::default();
+        let mut ti = FakeTi::new(text, &log);
+        if replace_fails {
+            ti.replace_result = Err(ReplaceError::ContextChanged);
+        }
+        let d = FlowDeps {
+            settings: s,
+            entries: &[],
+            detector: &RuleBasedDetector,
+            llm,
+        };
+        correction_replace_flow(
+            &d,
+            &ti,
+            released,
+            &FakeBadge(log.clone()),
+            &FakeNotifier(log.clone()),
+        );
+        snapshot(&log)
+    }
+
+    fn run_view(
+        s: &UserSettings,
+        llm: &CorrLlm,
+        text: Option<&str>,
+        released: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        let log: Log = Default::default();
+        let ti = FakeTi::new(text, &log);
+        let d = FlowDeps {
+            settings: s,
+            entries: &[],
+            detector: &RuleBasedDetector,
+            llm,
+        };
+        correction_view_flow(&d, &ti, released, &FakeView(log.clone()));
+        snapshot(&log)
+    }
+
+    fn last(log: &[String]) -> Option<&str> {
+        log.last().map(String::as_str)
+    }
+
+    #[test]
+    fn replace_success_replaces_with_corrected_text_inside_badge() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("안녕 하세요"),
+            false,
+            &|| true,
+        );
+        assert_eq!(
+            log,
+            [
+                "show:한국어 교정 중...",
+                "capture",
+                "replace:안녕하세요",
+                "hide"
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_polish_mode_shows_polish_loading_text() {
+        let s = UserSettings {
+            korean_correction_mode: ct_core::CorrectionMode::Polish,
+            ..UserSettings::default()
+        };
+        let log = run_replace(&s, &CorrLlm::ok(), Some("안녕 하세요"), false, &|| {
+            true
+        });
+        assert_eq!(log[0], "show:한국어 수정 중...");
+    }
+
+    #[test]
+    fn replace_ignores_include_original_option() {
+        let s = UserSettings {
+            include_original_on_replace: true,
+            ..UserSettings::default()
+        };
+        let log = run_replace(&s, &CorrLlm::ok(), Some("안녕 하세요"), false, &|| {
+            true
+        });
+        assert!(log.contains(&"replace:안녕하세요".to_string()));
+    }
+
+    #[test]
+    fn replace_waits_for_modifiers_and_never_captures_on_timeout() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("안녕 하세요"),
+            false,
+            &|| false,
+        );
+        assert_eq!(
+            log,
+            [format!("notify:{MSG_CORRECTION_REPLACE_NO_SELECTION}")]
+        );
+    }
+
+    #[test]
+    fn replace_base_not_korean_notifies_without_capture() {
+        let s = UserSettings {
+            base_language: Lang::En,
+            ..UserSettings::default()
+        };
+        let log: Log = Default::default();
+        let w = log.clone();
+        let released = move || {
+            push(&w, "wait");
+            true
+        };
+        let ti = FakeTi::new(Some("안녕 하세요"), &log);
+        let llm = CorrLlm::ok();
+        let d = FlowDeps {
+            settings: &s,
+            entries: &[],
+            detector: &RuleBasedDetector,
+            llm: &llm,
+        };
+        correction_replace_flow(
+            &d,
+            &ti,
+            &released,
+            &FakeBadge(log.clone()),
+            &FakeNotifier(log.clone()),
+        );
+        assert_eq!(
+            snapshot(&log),
+            [format!(
+                "notify:{}",
+                ct_core::CorrectionStatus::BaseNotKorean.user_message()
+            )]
+        );
+    }
+
+    #[test]
+    fn replace_capture_failure_notifies_after_badge_hidden() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            None,
+            false,
+            &|| true,
+        );
+        assert_eq!(
+            log,
+            [
+                "show:한국어 교정 중...".to_string(),
+                "capture".to_string(),
+                "hide".to_string(),
+                format!("notify:{MSG_CORRECTION_REPLACE_NO_SELECTION}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_unchanged_notifies_after_badge_hidden_and_never_replaces() {
+        let llm = CorrLlm {
+            single: Ok("안녕 하세요".into()),
+            ..CorrLlm::ok()
+        };
+        let log = run_replace(
+            &UserSettings::default(),
+            &llm,
+            Some("안녕 하세요"),
+            false,
+            &|| true,
+        );
+        assert!(no_replace(&log));
+        assert_eq!(
+            log[log.len() - 2..],
+            ["hide", "notify:수정할 부분이 없습니다."]
+        );
+    }
+
+    #[test]
+    fn replace_not_korean_text_notifies() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("hello world"),
+            false,
+            &|| true,
+        );
+        assert!(no_replace(&log));
+        assert_eq!(
+            last(&log),
+            Some("notify:선택한 문장의 주 언어가 한국어가 아니어서 교정하지 않았습니다.")
+        );
+    }
+
+    #[test]
+    fn replace_llm_failure_notifies_correction_failed() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::failing("boom"),
+            Some("안녕 하세요"),
+            false,
+            &|| true,
+        );
+        assert!(no_replace(&log));
+        assert_eq!(
+            last(&log),
+            Some("notify:교정에 실패하여 원본을 변경하지 않았습니다.")
+        );
+    }
+
+    #[test]
+    fn replace_cli_start_failure_shows_cli_notice() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::failing(SPAWN_ERR),
+            Some("안녕 하세요"),
+            false,
+            &|| true,
+        );
+        assert_eq!(
+            last(&log),
+            Some(format!("notify:{MSG_CLI_UNAVAILABLE}").as_str())
+        );
+    }
+
+    #[test]
+    fn replace_failure_notifies_replace_failed() {
+        let log = run_replace(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("안녕 하세요"),
+            true,
+            &|| true,
+        );
+        assert_eq!(
+            last(&log),
+            Some(format!("notify:{MSG_REPLACE_FAILED}").as_str())
+        );
+    }
+
+    #[test]
+    fn view_success_shows_loading_then_correction() {
+        let log = run_view(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("안녕 하세요"),
+            &|| true,
+        );
+        assert_eq!(
+            log,
+            [
+                "capture",
+                "loading:한국어 교정 중...",
+                "correction:1:WholeText"
+            ]
+        );
+    }
+
+    #[test]
+    fn view_uses_display_mode_setting() {
+        let s = UserSettings {
+            ctrl_ctrl_display_mode: DisplayMode::PerSentence,
+            ..UserSettings::default()
+        };
+        let log = run_view(&s, &CorrLlm::ok(), Some("안녕 하세요"), &|| true);
+        assert_eq!(last(&log), Some("correction:1:PerSentence"));
+    }
+
+    #[test]
+    fn view_timeout_shows_no_selection_and_never_captures() {
+        let log = run_view(
+            &UserSettings::default(),
+            &CorrLlm::ok(),
+            Some("안녕 하세요"),
+            &|| false,
+        );
+        assert_eq!(log, [format!("error:{MSG_CORRECTION_VIEW_NO_SELECTION}")]);
+    }
+
+    #[test]
+    fn view_base_not_korean_shows_error_without_capture() {
+        let s = UserSettings {
+            base_language: Lang::En,
+            ..UserSettings::default()
+        };
+        let log = run_view(&s, &CorrLlm::ok(), Some("안녕 하세요"), &|| true);
+        assert_eq!(
+            log,
+            [format!(
+                "error:{}",
+                ct_core::CorrectionStatus::BaseNotKorean.user_message()
+            )]
+        );
+    }
+
+    #[test]
+    fn view_capture_failure_shows_error_without_loading() {
+        let log = run_view(&UserSettings::default(), &CorrLlm::ok(), None, &|| true);
+        assert_eq!(
+            log,
+            [
+                "capture".to_string(),
+                format!("error:{MSG_CORRECTION_VIEW_NO_SELECTION}")
+            ]
+        );
+    }
+
+    #[test]
+    fn view_llm_failure_shows_correction_failed() {
+        let log = run_view(
+            &UserSettings::default(),
+            &CorrLlm::failing("boom"),
+            Some("안녕 하세요"),
+            &|| true,
+        );
+        assert_eq!(
+            last(&log),
+            Some("error:교정에 실패하여 원본을 변경하지 않았습니다.")
+        );
+    }
+
+    #[test]
+    fn view_cli_start_failure_shows_cli_notice() {
+        let log = run_view(
+            &UserSettings::default(),
+            &CorrLlm::failing(SPAWN_ERR),
+            Some("안녕 하세요"),
+            &|| true,
+        );
+        assert_eq!(
+            last(&log),
+            Some(format!("error:{MSG_CLI_UNAVAILABLE}").as_str())
+        );
     }
 }
