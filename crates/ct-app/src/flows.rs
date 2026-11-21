@@ -330,7 +330,6 @@ pub fn correction_replace_flow(
     badge: &dyn Badge,
     notifier: &dyn Notifier,
 ) {
-    let started = Instant::now();
     if d.settings.base_language != Lang::Ko {
         notifier.notify(CorrectionStatus::BaseNotKorean.user_message());
         return;
@@ -340,6 +339,8 @@ pub fn correction_replace_flow(
         notifier.notify(MSG_CORRECTION_REPLACE_NO_SELECTION);
         return;
     }
+    // Timed from here so the modifier wait does not eat the batch job budget.
+    let started = Instant::now();
     let loading = d.settings.korean_correction_mode.loading_message();
     let on_sheets = match route(
         sheets,
@@ -381,7 +382,6 @@ pub fn correction_view_flow(
     modifiers_released: &dyn Fn() -> bool,
     view: &dyn ExplainView,
 ) {
-    let started = Instant::now();
     let s = d.settings;
     if s.base_language != Lang::Ko {
         view.show_error(CorrectionStatus::BaseNotKorean.user_message());
@@ -392,6 +392,8 @@ pub fn correction_view_flow(
         view.show_error(MSG_CORRECTION_VIEW_NO_SELECTION);
         return;
     }
+    // Timed from here so the modifier wait does not eat the batch job budget.
+    let started = Instant::now();
     match route(sheets, "correction_view", None) {
         Routed::Refuse(m) => {
             view.show_error(&m);

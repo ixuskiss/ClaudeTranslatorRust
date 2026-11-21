@@ -5,11 +5,12 @@
 //! the text flow, and any other Sheets state is refused. Logs carry operation, route,
 //! status, cell counts and durations only, never cell text.
 
+use std::cell::Cell;
 use std::time::Instant;
 
 use ct_core::{
-    BatchLimits, CellKey, CellText, SheetsConfig, batch::correct_cells, compose_cell_replacements,
-    translate_cells,
+    BatchFailure, BatchLimits, CellKey, CellText, SheetsConfig, batch::correct_cells,
+    compose_cell_replacements, translate_cells,
 };
 use ct_sheets::{
     Route, SheetsInteraction, SheetsOutcome, SheetsRouting, SheetsStatus, TableResults,
@@ -18,7 +19,10 @@ use ct_sheets::{
 };
 use ct_win::chrome::ReplaceError;
 
-use crate::flows::{Badge, BadgeGuard, ExplainView, FlowDeps, LOADING_TEXT, Notifier};
+use crate::flows::{
+    Badge, BadgeGuard, ExplainView, FlowDeps, LOADING_TEXT, MSG_CLI_UNAVAILABLE, Notifier,
+    is_cli_start_failure,
+};
 
 pub const MSG_SHEETS_EDIT_TRANSLATE_FAILED: &str =
     "편집 중인 셀을 번역할 수 없습니다(수식·서식 또는 셀 상태를 확인할 수 없음).";
@@ -120,22 +124,37 @@ pub(crate) fn run_range_replace(
     notifier: &dyn Notifier,
 ) {
     badge.show(badge_text);
+    let cli_down = Cell::new(false);
     let outcome = {
         let _guard = BadgeGuard(badge);
         match job {
-            Job::Translate => translate_range(d, s, started),
-            Job::Correct => correct_range(d, s, started),
+            Job::Translate => translate_range(d, s, started, &cli_down),
+            Job::Correct => correct_range(d, s, started, &cli_down),
         }
     };
+    // The flag only counts when the job actually ended in the transform's failure status.
+    let cli_down = cli_down.get()
+        && matches!(
+            outcome.status,
+            SheetsStatus::TranslationFailed | SheetsStatus::CorrectionFailed
+        );
     tracing::info!(
         operation = job_operation(job, false),
         status = ?outcome.status,
+        cli_down,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "done"
     );
-    if outcome.status != SheetsStatus::Success {
+    if cli_down {
+        notifier.notify(MSG_CLI_UNAVAILABLE);
+    } else if outcome.status != SheetsStatus::Success {
         notifier.notify(&outcome.user_message());
     }
+}
+
+/// True when a batch failed because the Claude CLI could not be started (plan 3 D2).
+fn is_cli_down(f: &BatchFailure) -> bool {
+    matches!(f, BatchFailure::Llm(m) if is_cli_start_failure(m))
 }
 
 fn job_operation(job: Job, view: bool) -> &'static str {
@@ -147,7 +166,12 @@ fn job_operation(job: Job, view: bool) -> &'static str {
     }
 }
 
-fn translate_range(d: &FlowDeps, s: &SheetsDeps, started: Instant) -> SheetsOutcome {
+fn translate_range(
+    d: &FlowDeps,
+    s: &SheetsDeps,
+    started: Instant,
+    cli_down: &Cell<bool>,
+) -> SheetsOutcome {
     let st = d.settings;
     let limits = BatchLimits::from(s.config);
     let include = st.include_original_on_replace;
@@ -165,7 +189,10 @@ fn translate_range(d: &FlowDeps, s: &SheetsDeps, started: Instant) -> SheetsOutc
             &limits,
             &elapsed,
         )
-        .map_err(|f| translation_failure(&f))?;
+        .map_err(|f| {
+            cli_down.set(is_cli_down(&f));
+            translation_failure(&f)
+        })?;
         compose_cell_replacements(cells, &translated, include, limits.max_cell_chars)
             .map_err(|f| translation_failure(&f))
     };
@@ -179,7 +206,12 @@ fn translate_range(d: &FlowDeps, s: &SheetsDeps, started: Instant) -> SheetsOutc
     )
 }
 
-fn correct_range(d: &FlowDeps, s: &SheetsDeps, started: Instant) -> SheetsOutcome {
+fn correct_range(
+    d: &FlowDeps,
+    s: &SheetsDeps,
+    started: Instant,
+    cli_down: &Cell<bool>,
+) -> SheetsOutcome {
     let limits = BatchLimits::from(s.config);
     let elapsed = || started.elapsed();
     let mut transform = |cells: &[CellText]| {
@@ -192,7 +224,10 @@ fn correct_range(d: &FlowDeps, s: &SheetsDeps, started: Instant) -> SheetsOutcom
             &limits,
             &elapsed,
         )
-        .map_err(|f| correction_failure(&f))
+        .map_err(|f| {
+            cli_down.set(is_cli_down(&f));
+            correction_failure(&f)
+        })
     };
     replace_cells(
         s.range,
@@ -234,11 +269,14 @@ pub(crate) fn run_table(
     let limits = BatchLimits::from(s.config);
     let elapsed = || started.elapsed();
     let st = d.settings;
-    let results: Result<Vec<(CellKey, TableResults)>, SheetsOutcome> = match job {
-        Job::Translate if cells.is_empty() => Err(SheetsOutcome {
-            status: SheetsStatus::NoText,
-            reason: None,
-        }),
+    let results: Result<Vec<(CellKey, TableResults)>, (SheetsOutcome, bool)> = match job {
+        Job::Translate if cells.is_empty() => Err((
+            SheetsOutcome {
+                status: SheetsStatus::NoText,
+                reason: None,
+            },
+            false,
+        )),
         Job::Translate => translate_cells(
             &cells,
             d.entries,
@@ -259,7 +297,7 @@ pub(crate) fn run_table(
                 })
                 .collect()
         })
-        .map_err(|f| translation_failure(&f)),
+        .map_err(|f| (translation_failure(&f), is_cli_down(&f))),
         Job::Correct => correct_cells(
             &cells,
             d.entries,
@@ -274,7 +312,7 @@ pub(crate) fn run_table(
                 .map(|(key, text)| (key, vec![(None, text)]))
                 .collect()
         })
-        .map_err(|f| correction_failure(&f)),
+        .map_err(|f| (correction_failure(&f), is_cli_down(&f))),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match results {
@@ -288,15 +326,20 @@ pub(crate) fn run_table(
             );
             view.show_table(table_from(&selection, &results));
         }
-        Err(outcome) => {
+        Err((outcome, cli_down)) => {
             tracing::info!(
                 operation,
                 status = ?outcome.status,
+                cli_down,
                 cells = cells.len(),
                 elapsed_ms,
                 "done"
             );
-            view.show_error(&outcome.user_message());
+            if cli_down {
+                view.show_error(MSG_CLI_UNAVAILABLE);
+            } else {
+                view.show_error(&outcome.user_message());
+            }
         }
     }
 }
@@ -318,6 +361,7 @@ mod tests {
         DisplayMode, ExplanationResult, Lang, LlmProvider, RuleBasedDetector, SheetsConfig,
         UserSettings,
     };
+    use ct_llm::CLI_START_FAILURE_MARKER;
     use ct_sheets::{
         CaptureError, SheetLocation, SheetSelection, SheetsInputState, SheetsInteraction,
         SheetsOutcome, SheetsRouting, SheetsStatus, SheetsTable, column_letters,
@@ -338,7 +382,16 @@ mod tests {
     }
 
     /// Batch-aware fake: translations are upper-case language codes, corrections drop spaces.
-    struct SheetsLlm;
+    /// `cli_down`: every batch call fails like a CLI that could not be started.
+    struct SheetsLlm {
+        cli_down: bool,
+    }
+
+    fn cli_down_error() -> LlmError {
+        LlmError(format!(
+            "Claude CLI call failed: {CLI_START_FAILURE_MARKER}: Access is denied. (os error 5)"
+        ))
+    }
 
     fn upper(dests: &[Lang]) -> Vec<(Lang, String)> {
         dests
@@ -369,6 +422,9 @@ mod tests {
             &self,
             req: &BatchTranslationRequest,
         ) -> Result<BatchTranslationResult, LlmError> {
+            if self.cli_down {
+                return Err(cli_down_error());
+            }
             Ok(BatchTranslationResult {
                 items: req
                     .items
@@ -381,6 +437,9 @@ mod tests {
             &self,
             req: &BatchCorrectionRequest,
         ) -> Result<BatchCorrectionResult, LlmError> {
+            if self.cli_down {
+                return Err(cli_down_error());
+            }
             Ok(BatchCorrectionResult {
                 items: req
                     .items
@@ -514,6 +573,7 @@ mod tests {
         text: Option<&'static str>,
         replace_err: Option<fn() -> ReplaceError>,
         released: bool,
+        cli_down: bool,
     }
 
     struct Run {
@@ -536,6 +596,7 @@ mod tests {
                 text: None,
                 replace_err: None,
                 released: true,
+                cli_down: false,
             }
         }
         fn range(rows: &[&[&str]]) -> Self {
@@ -570,7 +631,9 @@ mod tests {
             };
             let mut ti = FakeTi::new(self.text, &log);
             ti.replace_err = self.replace_err;
-            let llm = SheetsLlm;
+            let llm = SheetsLlm {
+                cli_down: self.cli_down,
+            };
             let d = FlowDeps {
                 settings: &self.settings,
                 entries: &[],
@@ -805,6 +868,57 @@ mod tests {
         assert_eq!(
             r.log.last(),
             Some(&notify("선택한 셀에 한국어 텍스트가 없습니다."))
+        );
+    }
+
+    fn cli_down_case(rows: &[&[&str]]) -> Case {
+        Case {
+            cli_down: true,
+            ..Case::range(rows)
+        }
+    }
+
+    #[test]
+    fn range_translate_cli_start_failure_shows_cli_notice() {
+        let r = cli_down_case(&[&["안녕"]]).run(G::AltAlt);
+        assert_eq!(r.written, None);
+        assert_eq!(
+            r.log[r.log.len() - 2..],
+            ["hide".to_string(), notify(MSG_CLI_UNAVAILABLE)]
+        );
+    }
+
+    #[test]
+    fn range_correct_cli_start_failure_shows_cli_notice() {
+        let r = cli_down_case(&[&["안녕 하세요"]]).run(G::CorrectionReplace);
+        assert_eq!(r.written, None);
+        assert_eq!(
+            r.log[r.log.len() - 2..],
+            ["hide".to_string(), notify(MSG_CLI_UNAVAILABLE)]
+        );
+    }
+
+    #[test]
+    fn table_translate_cli_start_failure_shows_cli_notice() {
+        let r = cli_down_case(&[&["안녕"]]).run(G::CtrlCtrl);
+        assert_eq!(r.table, None);
+        assert_eq!(r.log.last(), Some(&format!("error:{MSG_CLI_UNAVAILABLE}")));
+    }
+
+    #[test]
+    fn table_correct_cli_start_failure_shows_cli_notice() {
+        let r = cli_down_case(&[&["안녕 하세요"]]).run(G::CorrectionView);
+        assert_eq!(r.table, None);
+        assert_eq!(r.log.last(), Some(&format!("error:{MSG_CLI_UNAVAILABLE}")));
+    }
+
+    #[test]
+    fn correction_view_range_without_korean_shows_no_korean_text() {
+        let r = Case::range(&[&["Hello"]]).run(G::CorrectionView);
+        assert_eq!(r.table, None);
+        assert_eq!(
+            r.log.last().map(String::as_str),
+            Some("error:선택한 셀에 한국어 텍스트가 없습니다.")
         );
     }
 
