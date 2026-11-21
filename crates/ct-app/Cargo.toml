@@ -18,5 +18,8 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 
+[dev-dependencies]
+i-slint-backend-testing = "=1.19.0"
+
 [build-dependencies]
 slint-build = "1.19.0"

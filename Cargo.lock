@@ -966,6 +966,7 @@ dependencies = [
  "ct-llm",
  "ct-sheets",
  "ct-win",
+ "i-slint-backend-testing",
  "raw-window-handle",
  "slint",
  "slint-build",

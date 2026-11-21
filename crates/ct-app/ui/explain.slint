@@ -103,17 +103,28 @@ export component ExplainWin inherits Window {
                         horizontal-stretch: 1;
                     }
 
-                    Rectangle {
+                    // Close button: the X is drawn as two lines, not a font glyph (the
+                    // default font has no U+2715 on some PCs and shows a box).
+                    close-btn := Rectangle {
                         width: 24px;
                         height: 24px;
-                        Text {
-                            text: "✕";
-                            color: #8A8A8A;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        border-radius: 4px;
+                        background: close-ta.has-hover ? #F1E4E1 : transparent;
+                        Path {
+                            width: 10px;
+                            height: 10px;
+                            viewbox-width: 10;
+                            viewbox-height: 10;
+                            stroke: #8A8A8A;
+                            stroke-width: 1.6px;
+                            MoveTo { x: 0; y: 0; }
+                            LineTo { x: 10; y: 10; }
+                            MoveTo { x: 10; y: 0; }
+                            LineTo { x: 0; y: 10; }
                         }
 
-                        TouchArea {
+                        close-ta := TouchArea {
+                            mouse-cursor: pointer;
                             clicked => {
                                 root.close-requested();
                             }
@@ -266,10 +277,18 @@ export component ExplainWin inherits Window {
                     }
                 }
 
-                Text {
-                    text: "닫기 Esc";
-                    color: #8A8A8A;
-                    horizontal-alignment: right;
+                HorizontalLayout {
+                    alignment: end;
+                    Text {
+                        text: "닫기 Esc";
+                        color: #8A8A8A;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.close-requested();
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -505,6 +505,7 @@ impl SurfaceFactory for SlintFactory {
         let weak = win.as_weak();
         win.on_close_requested(move || {
             // Closing only hides; the app keeps running (v5 §4.6).
+            tracing::debug!("explain window: close requested");
             if let Some(w) = weak.upgrade()
                 && let Err(e) = w.hide()
             {
@@ -1000,5 +1001,82 @@ mod tests {
         assert_eq!(log.fits, 2);
         assert!(log.applied[0].table.is_some());
         assert!(log.applied[1..].iter().all(|s| s.table.is_none()));
+    }
+}
+
+/// Real Slint input routing for the window chrome (testing backend, no event loop).
+#[cfg(test)]
+mod input_tests {
+    use super::ExplainWin;
+    use slint::ComponentHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const W: f32 = 480.0;
+    const H: f32 = 240.0;
+
+    fn click(win: &ExplainWin, x: f32, y: f32) {
+        let position = slint::LogicalPosition::new(x, y);
+        let w = win.window();
+        w.dispatch_event(WindowEvent::PointerMoved { position });
+        w.dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        w.dispatch_event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+    }
+
+    fn press(win: &ExplainWin, key: Key) {
+        let text: slint::SharedString = key.into();
+        let w = win.window();
+        w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        w.dispatch_event(WindowEvent::KeyReleased { text });
+    }
+
+    /// One test function: the testing platform can be set once per process and Slint
+    /// components must stay on the thread that created them.
+    #[test]
+    fn close_button_and_escape_request_close() {
+        i_slint_backend_testing::init_no_event_loop();
+        let win = ExplainWin::new().unwrap();
+        win.window().set_size(slint::LogicalSize::new(W, H));
+        let closes = Rc::new(Cell::new(0));
+        let drags = Rc::new(Cell::new(0));
+        let c = closes.clone();
+        win.on_close_requested(move || c.set(c.get() + 1));
+        let d = drags.clone();
+        win.on_drag_requested(move || d.set(d.get() + 1));
+        win.show().unwrap();
+
+        // Close button: 24x24 at the right of the header row (16 px side, 12 px top padding).
+        click(&win, W - 16.0 - 12.0, 12.0 + 12.0);
+        assert_eq!(
+            closes.get(),
+            1,
+            "close button click (drags={})",
+            drags.get()
+        );
+
+        press(&win, Key::Escape);
+        assert_eq!(closes.get(), 2, "Escape key");
+
+        // The footer "닫기 Esc" (bottom right, 12 px bottom padding) is clickable too.
+        click(&win, W - 16.0 - 12.0, H - 12.0 - 8.0);
+        assert_eq!(closes.get(), 3, "footer close click");
+
+        // After clicking a read-only text cell, Escape must still close.
+        win.set_cards(slint::ModelRc::new(slint::VecModel::from(vec![
+            super::ExplainCard {
+                original: "원문".into(),
+                translations: slint::ModelRc::default(),
+            },
+        ])));
+        click(&win, 60.0, 90.0);
+        press(&win, Key::Escape);
+        assert_eq!(closes.get(), 4, "Escape after clicking text");
     }
 }

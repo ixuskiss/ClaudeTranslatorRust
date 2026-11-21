@@ -7,11 +7,12 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
 };
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_SETFOREGROUND,
-    MB_TOPMOST, MessageBoxW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_NOTOPMOST,
+    HWND_TOPMOST, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 use windows::core::HSTRING;
 
@@ -108,8 +109,25 @@ pub fn bring_to_front(hwnd: HWND) {
         if let Err(e) = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) {
             tracing::warn!(error = %e, "bring_to_front: topmost failed");
         }
-        if !SetForegroundWindow(hwnd).as_bool() {
-            tracing::debug!("bring_to_front: SetForegroundWindow refused");
+        if !SetForegroundWindow(hwnd).as_bool() || GetForegroundWindow() != hwnd {
+            // Windows refuses foreground changes from a background process (e.g. right
+            // after a hotkey while Chrome is active). Attach to the foreground thread's
+            // input queue for the call (v5 spike S3); otherwise Esc keeps going to Chrome.
+            let fg = GetForegroundWindow();
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            let me = GetCurrentThreadId();
+            let attached =
+                fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, true).as_bool();
+            let ok = SetForegroundWindow(hwnd).as_bool();
+            if attached {
+                let _ = AttachThreadInput(me, fg_tid, false);
+            }
+            tracing::debug!(
+                attached,
+                ok,
+                foreground = GetForegroundWindow() == hwnd,
+                "bring_to_front: AttachThreadInput fallback"
+            );
         }
         if let Err(e) = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags) {
             tracing::warn!(error = %e, "bring_to_front: notopmost failed");
