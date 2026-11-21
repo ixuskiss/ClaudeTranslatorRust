@@ -612,6 +612,13 @@ mod tests {
         fn show_result(&self, _result: ExplanationResult, _mode: DisplayMode) {
             push(&self.0, "view.result");
         }
+        fn show_correction(
+            &self,
+            _sentences: Vec<ct_core::CorrectionSentence>,
+            _mode: DisplayMode,
+        ) {
+            push(&self.0, "view.correction");
+        }
     }
 
     struct NoCapture(Log);

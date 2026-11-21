@@ -6,8 +6,9 @@
 use std::time::Instant;
 
 use ct_core::{
-    DICTIONARY_INTEGRITY_MESSAGE, DictionaryEntry, DisplayMode, ExplanationResult,
-    LanguageDetector, LlmProvider, TranslateError, UserSettings, explain_text, translate_text,
+    CorrectionSentence, DICTIONARY_INTEGRITY_MESSAGE, DictionaryEntry, DisplayMode,
+    ExplanationResult, LanguageDetector, LlmProvider, TranslateError, UserSettings, explain_text,
+    translate_text,
 };
 use ct_llm::CLI_START_FAILURE_MARKER;
 use ct_win::chrome::{ReplaceError, TextInteraction};
@@ -37,6 +38,7 @@ pub trait ExplainView: Send + Sync {
     fn show_loading(&self, text: &str);
     fn show_error(&self, message: &str);
     fn show_result(&self, result: ExplanationResult, mode: DisplayMode);
+    fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode);
 }
 
 pub struct FlowDeps<'a> {
@@ -366,6 +368,9 @@ mod tests {
         }
         fn show_result(&self, r: ExplanationResult, mode: DisplayMode) {
             push(&self.0, format!("result:{}:{mode:?}", r.sentences.len()));
+        }
+        fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode) {
+            push(&self.0, format!("correction:{}:{mode:?}", sentences.len()));
         }
     }
 

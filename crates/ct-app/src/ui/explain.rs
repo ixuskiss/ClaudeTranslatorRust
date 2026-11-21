@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use ct_core::{DisplayMode, ExplanationResult, Lang};
+use ct_core::{CorrectionSentence, DisplayMode, ExplanationResult, Lang};
 use slint::winit_030::WinitWindowAccessor;
 use slint::winit_030::winit::window::ResizeDirection;
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -91,6 +91,34 @@ pub fn build_view_state(result: &ExplanationResult, mode: DisplayMode) -> Explai
                 })
                 .collect();
             vec![block(original, columns)]
+        }
+    };
+    ExplainViewState {
+        status: None,
+        blocks,
+    }
+}
+
+/// Correction result: same grouping as `build_view_state`, corrected text without a tag.
+pub fn build_correction_view_state(
+    sentences: &[CorrectionSentence],
+    mode: DisplayMode,
+) -> ExplainViewState {
+    let one = |original: String, corrected: String| ExplainBlock {
+        original,
+        translations: vec![(None, corrected)],
+    };
+    let blocks = match mode {
+        DisplayMode::PerSentence => sentences
+            .iter()
+            .map(|s| one(s.original.clone(), s.corrected.clone()))
+            .collect(),
+        DisplayMode::WholeText if sentences.is_empty() => Vec::new(),
+        DisplayMode::WholeText => {
+            let join = |f: fn(&CorrectionSentence) -> &str| {
+                sentences.iter().map(f).collect::<Vec<_>>().join("\n")
+            };
+            vec![one(join(|s| &s.original), join(|s| &s.corrected))]
         }
     };
     ExplainViewState {
@@ -384,6 +412,10 @@ impl ExplainView for ExplainWindow {
     fn show_result(&self, result: ExplanationResult, mode: DisplayMode) {
         self.dispatch(build_view_state(&result, mode), Present::Fit);
     }
+
+    fn show_correction(&self, sentences: Vec<CorrectionSentence>, mode: DisplayMode) {
+        self.dispatch(build_correction_view_state(&sentences, mode), Present::Fit);
+    }
 }
 
 impl Notifier for ExplainWindow {
@@ -470,6 +502,55 @@ mod tests {
         let per = build_view_state(&one, DisplayMode::PerSentence);
         assert_eq!(per.blocks[0].translations, vec![(None, "Hi.".into())]);
         assert_eq!(per.blocks[1].translations, vec![(None, "Bye.".into())]);
+    }
+
+    fn corrections() -> Vec<ct_core::CorrectionSentence> {
+        ["가", "나"]
+            .iter()
+            .map(|o| ct_core::CorrectionSentence {
+                original: (*o).into(),
+                corrected: format!("{o}."),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn correction_per_sentence_one_block_per_sentence_without_tag() {
+        let state = build_correction_view_state(&corrections(), DisplayMode::PerSentence);
+        assert_eq!(state.status, None);
+        assert_eq!(
+            state.blocks,
+            vec![
+                ExplainBlock {
+                    original: "가".into(),
+                    translations: vec![(None, "가.".into())],
+                },
+                ExplainBlock {
+                    original: "나".into(),
+                    translations: vec![(None, "나.".into())],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn correction_whole_text_joins_with_newline() {
+        let state = build_correction_view_state(&corrections(), DisplayMode::WholeText);
+        assert_eq!(state.status, None);
+        assert_eq!(
+            state.blocks,
+            vec![ExplainBlock {
+                original: "가\n나".into(),
+                translations: vec![(None, "가.\n나.".into())],
+            }]
+        );
+    }
+
+    #[test]
+    fn correction_empty_sentences_has_no_blocks() {
+        let state = build_correction_view_state(&[], DisplayMode::WholeText);
+        assert!(state.blocks.is_empty());
+        assert_eq!(state.status, None);
     }
 
     #[test]
