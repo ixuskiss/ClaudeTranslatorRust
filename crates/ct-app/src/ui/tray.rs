@@ -250,12 +250,12 @@ mod tests {
         let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
         assert_eq!(at(0, 0)[3], 0, "top-left corner transparent");
         assert_eq!(at(31, 0)[3], 0, "top-right corner transparent");
-        // Back bubble: opaque blue near its left edge.
-        let blue = at(3, 10);
+        // Back bubble: opaque blue right of the "A".
+        let blue = at(17, 4);
         assert_eq!(blue[3], 0xFF);
         assert!(blue[2] > 0xC0 && blue[0] < 0x60, "blue bubble {blue:?}");
         // Front bubble: opaque white inside, left of the "가" glyph.
-        let white = at(15, 21);
+        let white = at(13, 20);
         assert_eq!(white, &[0xFF, 0xFF, 0xFF, 0xFF]);
     }
 }
