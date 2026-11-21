@@ -7,7 +7,7 @@ use crate::dictionary::{
     validate_integrity_across,
 };
 use crate::lang::Lang;
-use crate::llm::{CorrectionRequest, CorrectionSentence, LlmProvider};
+use crate::llm::{CorrectionRequest, CorrectionSentence, LlmError, LlmProvider};
 use crate::settings::CorrectionMode;
 use crate::translate::DICTIONARY_INTEGRITY_MESSAGE;
 
@@ -54,6 +54,8 @@ pub struct CorrectionOutcome {
     pub status: CorrectionStatus,
     pub corrected_text: Option<String>,
     pub sentences: Option<Vec<CorrectionSentence>>,
+    /// LLM error text; `Some` only when `LlmFailed` was caused by `Err(LlmError)`. Never logged.
+    pub llm_error: Option<String>,
 }
 
 impl CorrectionOutcome {
@@ -62,6 +64,14 @@ impl CorrectionOutcome {
             status,
             corrected_text: None,
             sentences: None,
+            llm_error: None,
+        }
+    }
+
+    fn llm_failed(llm_error: Option<String>) -> Self {
+        Self {
+            llm_error,
+            ..Self::status_only(CorrectionStatus::LlmFailed)
         }
     }
 }
@@ -142,7 +152,8 @@ fn run_single(
     };
     let llm_text = match llm.correct(&request) {
         Ok(t) if !t.trim().is_empty() => t,
-        _ => return CorrectionOutcome::status_only(CorrectionStatus::LlmFailed),
+        Ok(_) => return CorrectionOutcome::llm_failed(None),
+        Err(LlmError(m)) => return CorrectionOutcome::llm_failed(Some(m)),
     };
     // Exactly one of each known token, and no token the model invented.
     if !validate_integrity(&mapping, &llm_text)
@@ -165,6 +176,7 @@ fn run_single(
         status: CorrectionStatus::Success,
         corrected_text: Some(format!("{leading}{restored}{trailing}")),
         sentences: None,
+        llm_error: None,
     }
 }
 
@@ -186,7 +198,8 @@ fn run_sentences(
     };
     let sentences = match llm.correct_sentences(&request) {
         Ok(s) if s.iter().any(|x| !x.corrected.trim().is_empty()) => s,
-        _ => return CorrectionOutcome::status_only(CorrectionStatus::LlmFailed),
+        Ok(_) => return CorrectionOutcome::llm_failed(None),
+        Err(LlmError(m)) => return CorrectionOutcome::llm_failed(Some(m)),
     };
     let originals: Vec<&str> = sentences.iter().map(|s| s.original.as_str()).collect();
     let corrected: Vec<&str> = sentences.iter().map(|s| s.corrected.as_str()).collect();
@@ -212,6 +225,7 @@ fn run_sentences(
         status: CorrectionStatus::Success,
         corrected_text: None,
         sentences: Some(restored),
+        llm_error: None,
     }
 }
 
@@ -220,7 +234,6 @@ mod tests {
     use super::*;
     use crate::detector::RuleBasedDetector;
     use crate::dictionary::Action;
-    use crate::llm::LlmError;
     use crate::test_support::FakeLlm;
     use std::collections::BTreeMap;
 
@@ -267,6 +280,66 @@ mod tests {
             original: original.into(),
             corrected: corrected.into(),
         }
+    }
+
+    const START_ERR: &str = "failed to start Claude CLI: x";
+
+    #[test]
+    fn llm_error_is_kept_on_llm_failed() {
+        let llm = FakeLlm::new();
+        llm.push_correct(Err(LlmError(START_ERR.into())));
+        let out = run_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::LlmFailed);
+        assert_eq!(out.llm_error.as_deref(), Some(START_ERR));
+
+        let llm = FakeLlm::new();
+        llm.push_correct_sentences(Err(LlmError(START_ERR.into())));
+        let out = run_sentences_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::LlmFailed);
+        assert_eq!(out.llm_error.as_deref(), Some(START_ERR));
+    }
+
+    #[test]
+    fn empty_llm_result_has_no_llm_error() {
+        let llm = FakeLlm::new();
+        llm.push_correct(Ok("  \n".into()));
+        let out = run_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::LlmFailed);
+        assert_eq!(out.llm_error, None);
+
+        let llm = FakeLlm::new();
+        llm.push_correct_sentences(Ok(vec![cs("확인햇습니다", "  ")]));
+        let out = run_sentences_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::LlmFailed);
+        assert_eq!(out.llm_error, None);
+    }
+
+    #[test]
+    fn non_llm_statuses_have_no_llm_error() {
+        let llm = FakeLlm::new();
+        let out = run(
+            "확인햇습니다",
+            Lang::En,
+            CorrectionMode::Spelling,
+            &[],
+            &llm,
+        );
+        assert_eq!(out.status, CorrectionStatus::BaseNotKorean);
+        assert_eq!(out.llm_error, None);
+
+        let out = run_ko("Please check this.", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::NotKorean);
+        assert_eq!(out.llm_error, None);
+
+        llm.push_correct(Ok("확인햇습니다".into()));
+        let out = run_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::Unchanged);
+        assert_eq!(out.llm_error, None);
+
+        llm.push_correct(Ok("확인했습니다".into()));
+        let out = run_ko("확인햇습니다", &[], &llm);
+        assert_eq!(out.status, CorrectionStatus::Success);
+        assert_eq!(out.llm_error, None);
     }
 
     // v5 test_check_base_language + test_base_not_korean_blocks_without_calling_llm
