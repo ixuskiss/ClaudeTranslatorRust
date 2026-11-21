@@ -26,8 +26,20 @@ pub struct CapturedText {
     pub context: EditingContext,
 }
 
+/// 캡처 실패 이유. NoFocus·Unsupported는 일시적일 수 있어 재시도하고, NoContext(전략은 맞았지만
+/// 선택이 없는 등 안전한 컨텍스트가 없음)는 재시도해도 같으므로 바로 끝낸다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMiss {
+    NoFocus,
+    Unsupported,
+    NoContext,
+}
+
 pub trait TextInteraction: Send + Sync {
     fn capture(&self) -> Option<CapturedText>;
+    fn try_capture(&self) -> Result<CapturedText, CaptureMiss> {
+        self.capture().ok_or(CaptureMiss::NoFocus)
+    }
     fn replace(&self, captured: &CapturedText, new_text: &str) -> Result<(), ReplaceError>;
 }
 
@@ -83,11 +95,20 @@ fn context_changed(captured: &EditingContext, now: &EditingContext) -> bool {
 
 impl TextInteraction for ChromeAdapter {
     fn capture(&self) -> Option<CapturedText> {
+        self.try_capture().ok()
+    }
+
+    fn try_capture(&self) -> Result<CapturedText, CaptureMiss> {
         // 조사(Ctrl+C·sentinel·복원) 전체를 다른 계열의 캡처·교체와 겹치지 않게 한다(R8).
         let _section = lock_clipboard_section();
-        let focused = self.backend.focused_element()?;
-        let context = self.strategy_for(&focused)?.identify_context(&focused)?;
-        Some(CapturedText { context })
+        let focused = self.backend.focused_element().ok_or(CaptureMiss::NoFocus)?;
+        let strategy = self
+            .strategy_for(&focused)
+            .ok_or(CaptureMiss::Unsupported)?;
+        let context = strategy
+            .identify_context(&focused)
+            .ok_or(CaptureMiss::NoContext)?;
+        Ok(CapturedText { context })
     }
 
     fn replace(&self, captured: &CapturedText, new_text: &str) -> Result<(), ReplaceError> {
@@ -142,15 +163,23 @@ impl<T: TextInteraction> RetryingInteraction<T> {
 
 impl<T: TextInteraction> TextInteraction for RetryingInteraction<T> {
     fn capture(&self) -> Option<CapturedText> {
+        self.try_capture().ok()
+    }
+
+    fn try_capture(&self) -> Result<CapturedText, CaptureMiss> {
+        let mut last = CaptureMiss::NoFocus;
         for attempt in 0..self.attempts {
-            if let Some(c) = self.inner.capture() {
-                return Some(c);
+            match self.inner.try_capture() {
+                Ok(c) => return Ok(c),
+                // 선택 없음 등은 다시 해도 같으므로 바로 끝낸다.
+                Err(CaptureMiss::NoContext) => return Err(CaptureMiss::NoContext),
+                Err(miss) => last = miss,
             }
             if attempt + 1 < self.attempts {
                 sleep(self.delay);
             }
         }
-        None
+        Err(last)
     }
 
     fn replace(&self, captured: &CapturedText, new_text: &str) -> Result<(), ReplaceError> {
@@ -577,6 +606,91 @@ mod tests {
         assert_eq!(r.inner.capture_calls.load(Ordering::SeqCst), 5);
         // 시도 사이에만 80 ms씩 4번 쉰다 (마지막 뒤에는 쉬지 않는다).
         assert!(start.elapsed() >= Duration::from_millis(320));
+    }
+
+    struct MissInteraction {
+        miss: CaptureMiss,
+        calls: AtomicUsize,
+    }
+    impl TextInteraction for MissInteraction {
+        fn capture(&self) -> Option<CapturedText> {
+            self.try_capture().ok()
+        }
+        fn try_capture(&self) -> Result<CapturedText, CaptureMiss> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.miss)
+        }
+        fn replace(&self, _: &CapturedText, _: &str) -> Result<(), ReplaceError> {
+            Ok(())
+        }
+    }
+
+    fn miss_run(miss: CaptureMiss) -> (usize, Duration) {
+        let r = RetryingInteraction::with_delay(
+            MissInteraction {
+                miss,
+                calls: AtomicUsize::new(0),
+            },
+            5,
+            Duration::from_millis(20),
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(r.try_capture(), Err(miss));
+        (r.inner.calls.load(Ordering::SeqCst), start.elapsed())
+    }
+
+    #[test]
+    fn retrying_stops_after_one_attempt_on_no_context() {
+        let (calls, elapsed) = miss_run(CaptureMiss::NoContext);
+        assert_eq!(calls, 1);
+        assert!(elapsed < Duration::from_millis(20));
+        // capture()도 같은 규칙을 따른다.
+        let r = RetryingInteraction::with_delay(
+            MissInteraction {
+                miss: CaptureMiss::NoContext,
+                calls: AtomicUsize::new(0),
+            },
+            5,
+            NO_DELAY,
+        );
+        assert!(r.capture().is_none());
+        assert_eq!(r.inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retrying_retries_on_no_focus_and_unsupported() {
+        assert_eq!(miss_run(CaptureMiss::NoFocus).0, 5);
+        assert_eq!(miss_run(CaptureMiss::Unsupported).0, 5);
+    }
+
+    fn docs(selection: Option<&str>) -> FocusedElement {
+        FocusedElement {
+            url: "https://docs.google.com/document/d/x/edit".into(),
+            role: Role::Compose,
+            name: String::new(),
+            full_text: String::new(),
+            selection_text: selection.map(String::from),
+        }
+    }
+
+    #[test]
+    fn chrome_try_capture_reports_each_variant() {
+        assert_eq!(
+            adapter(vec![None]).0.try_capture().unwrap_err(),
+            CaptureMiss::NoFocus
+        );
+        let mut e = chat(None);
+        e.url = "https://example.com/x".into();
+        assert_eq!(
+            adapter(vec![Some(e)]).0.try_capture().unwrap_err(),
+            CaptureMiss::Unsupported
+        );
+        assert_eq!(
+            adapter(vec![Some(docs(None))]).0.try_capture().unwrap_err(),
+            CaptureMiss::NoContext
+        );
+        let ok = adapter(vec![Some(docs(Some("abc")))]).0.try_capture();
+        assert!(ok.is_ok_and(|c| c.context.has_selection));
     }
 
     #[test]

@@ -6,7 +6,8 @@ pub mod strategy;
 pub mod uia_backend;
 
 pub use adapter::{
-    CapturedText, ChromeAdapter, ReplaceError, RetryingInteraction, TextInteraction, UiaBackend,
+    CaptureMiss, CapturedText, ChromeAdapter, ReplaceError, RetryingInteraction, TextInteraction,
+    UiaBackend,
 };
 pub use role::{
     Role, classify_focused_role, is_docs_url, is_gmail_url, is_google_chat_url, is_slides_url,
