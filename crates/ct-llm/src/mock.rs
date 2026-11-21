@@ -2,6 +2,7 @@
 //! destination language and leaves everything else (including placeholders) untouched.
 
 use ct_core::{
+    BatchCorrectionRequest, BatchCorrectionResult, BatchTranslationRequest, BatchTranslationResult,
     CorrectionRequest, CorrectionSentence, ExplanationRequest, ExplanationResult,
     ExplanationSentence, Lang, LlmError, LlmProvider, TranslationRequest, TranslationResult,
 };
@@ -68,6 +69,32 @@ impl LlmProvider for MockProvider {
 
     fn correct(&self, req: &CorrectionRequest) -> Result<String, LlmError> {
         Ok(format!("[교정] {}", req.text))
+    }
+
+    fn translate_batch(
+        &self,
+        req: &BatchTranslationRequest,
+    ) -> Result<BatchTranslationResult, LlmError> {
+        Ok(BatchTranslationResult {
+            items: req
+                .items
+                .iter()
+                .map(|i| (i.id.clone(), tag(&i.destinations, &i.text)))
+                .collect(),
+        })
+    }
+
+    fn correct_batch(
+        &self,
+        req: &BatchCorrectionRequest,
+    ) -> Result<BatchCorrectionResult, LlmError> {
+        Ok(BatchCorrectionResult {
+            items: req
+                .items
+                .iter()
+                .map(|i| (i.id.clone(), format!("[교정] {}", i.text)))
+                .collect(),
+        })
     }
 
     fn correct_sentences(
@@ -140,6 +167,61 @@ mod tests {
             .unwrap();
         let originals: Vec<_> = r.sentences.iter().map(|s| s.original.as_str()).collect();
         assert_eq!(originals, ["A.", "B?", "C"]);
+    }
+
+    #[test]
+    fn mock_batch_translates_every_destination() {
+        use ct_core::BatchItem;
+        let r = MockProvider
+            .translate_batch(&BatchTranslationRequest {
+                items: vec![
+                    BatchItem {
+                        id: "c0".into(),
+                        text: "안녕".into(),
+                        source: Lang::Ko,
+                        destinations: vec![Lang::En, Lang::Ja],
+                    },
+                    BatchItem {
+                        id: "c1".into(),
+                        text: "Hello ⟦0⟧".into(),
+                        source: Lang::En,
+                        destinations: vec![Lang::Ko],
+                    },
+                ],
+                tone: Tone::Neutral,
+            })
+            .unwrap();
+        assert_eq!(
+            r.items,
+            vec![
+                (
+                    "c0".to_string(),
+                    vec![
+                        (Lang::En, "[en] 안녕".to_string()),
+                        (Lang::Ja, "[ja] 안녕".to_string())
+                    ]
+                ),
+                (
+                    "c1".to_string(),
+                    vec![(Lang::Ko, "[ko] Hello ⟦0⟧".to_string())]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mock_batch_correction_tags_each_item() {
+        use ct_core::BatchCorrectionItem;
+        let r = MockProvider
+            .correct_batch(&BatchCorrectionRequest {
+                items: vec![BatchCorrectionItem {
+                    id: "c0".into(),
+                    text: "가".into(),
+                }],
+                mode: CorrectionMode::Spelling,
+            })
+            .unwrap();
+        assert_eq!(r.items, vec![("c0".to_string(), "[교정] 가".to_string())]);
     }
 
     #[test]

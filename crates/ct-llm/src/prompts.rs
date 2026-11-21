@@ -4,8 +4,10 @@
 //! deliberately strengthened (full rewrite allowed, banned hype words).
 
 use ct_core::{
-    CorrectionMode, CorrectionRequest, ExplanationRequest, Lang, Tone, TranslationRequest,
+    BatchCorrectionRequest, BatchTranslationRequest, CorrectionMode, CorrectionRequest,
+    ExplanationRequest, Lang, Tone, TranslationRequest,
 };
+use serde_json::Value;
 
 /// Words the polish prompt forbids introducing unless the original already uses them.
 pub const POLISH_BANNED_WORDS: &[&str] = &[
@@ -203,6 +205,80 @@ pub fn correction_prompt(req: &CorrectionRequest, model: &str) -> String {
     )
 }
 
+/// Serializes like Python's `json.dumps(..., ensure_ascii=False)` (`, ` and `: ` separators).
+fn json_items(items: Vec<Vec<(&str, Value)>>) -> String {
+    let rendered: Vec<String> = items
+        .into_iter()
+        .map(|fields| {
+            let body: Vec<String> = fields
+                .into_iter()
+                .map(|(k, v)| format!("\"{k}\": {v}"))
+                .collect();
+            format!("{{{}}}", body.join(", "))
+        })
+        .collect();
+    format!("{{\"items\": [{}]}}", rendered.join(", "))
+}
+
+pub fn batch_translation_prompt(req: &BatchTranslationRequest, model: &str) -> String {
+    let items = req
+        .items
+        .iter()
+        .map(|i| {
+            vec![
+                ("id", Value::from(i.id.as_str())),
+                ("source", Value::from(i.source.code())),
+                (
+                    "targets",
+                    Value::from(i.destinations.iter().map(|l| l.code()).collect::<Vec<_>>()),
+                ),
+                ("text", Value::from(i.text.as_str())),
+            ]
+        })
+        .collect();
+    format!(
+        "Translate the text of every item below from its source language into each of its \
+         target languages. Translate each item independently: never merge, split, reorder, add \
+         or drop items, and return each item's id unchanged. Keep line breaks and tabs inside \
+         each text as they are. Preserve any tokens that look like ⟦N⟧ exactly as-is within \
+         the same item -- do not translate, move to another item, or remove them. \
+         {formatting}{tone}Respond with only JSON matching this shape: \
+         {{\"translations\": [{{\"id\": str, \"texts\": {{\"<target code>\": str}}}}]}} where each \
+         item's \"texts\" has exactly that item's target codes as keys.\n\nItems:\n{items}",
+        formatting = formatting_instruction(model),
+        tone = tone_instruction(req.tone),
+        items = json_items(items),
+    )
+}
+
+pub fn batch_correction_prompt(req: &BatchCorrectionRequest, model: &str) -> String {
+    let extra = if is_polish(req.mode) {
+        POLISH_MERGE_SPLIT_INSTRUCTION
+    } else {
+        ""
+    };
+    let items = req
+        .items
+        .iter()
+        .map(|i| {
+            vec![
+                ("id", Value::from(i.id.as_str())),
+                ("text", Value::from(i.text.as_str())),
+            ]
+        })
+        .collect();
+    format!(
+        "{}{}Proofread the text of every item below. Correct each item independently: never \
+         merge, split, reorder, add or drop items, and return each item's id unchanged. Keep \
+         line breaks and tabs inside each text as they are. {}Respond with only JSON matching \
+         this shape: {{\"corrections\": [{{\"id\": str, \"corrected\": str}}]}} \n\nItems:\n{}",
+        correction_preamble(req.mode),
+        extra,
+        correction_formatting_instruction(model),
+        json_items(items),
+    )
+}
+
 pub fn sentence_correction_prompt(req: &CorrectionRequest) -> String {
     let extra = if is_polish(req.mode) {
         POLISH_ONE_TO_ONE_INSTRUCTION
@@ -236,6 +312,81 @@ mod tests {
         CorrectionRequest {
             text: "x".into(),
             mode,
+        }
+    }
+
+    fn breq(items: Vec<(&str, &str, Lang, Vec<Lang>)>, tone: Tone) -> BatchTranslationRequest {
+        BatchTranslationRequest {
+            items: items
+                .into_iter()
+                .map(|(id, text, source, destinations)| ct_core::BatchItem {
+                    id: id.into(),
+                    text: text.into(),
+                    source,
+                    destinations,
+                })
+                .collect(),
+            tone,
+        }
+    }
+
+    #[test]
+    fn batch_translation_prompt_lists_targets_per_item() {
+        let r = breq(
+            vec![
+                ("c0", "a\tb\n\"q\" ⟦0⟧", Lang::Ko, vec![Lang::En, Lang::Ja]),
+                ("c1", "z", Lang::En, vec![Lang::Ko]),
+            ],
+            Tone::Neutral,
+        );
+        let p = batch_translation_prompt(&r, "sonnet");
+        assert!(
+            p.contains(r#""id": "c0", "source": "ko", "targets": ["en","ja"]"#),
+            "{p}"
+        );
+        assert!(p.contains(r#""id": "c1", "source": "en", "targets": ["ko"]"#));
+        assert!(p.contains("\\t") && p.contains("\\n"));
+        assert!(p.contains("⟦N⟧"));
+        assert!(p.contains(r#"{"translations": [{"id": str, "texts": {"<target code>": str}}]}"#));
+        let json = &p[p.find("\n\nItems:\n").unwrap() + 9..];
+        let v: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["items"][0]["text"], "a\tb\n\"q\" ⟦0⟧");
+        assert_eq!(v["items"][0]["targets"], serde_json::json!(["en", "ja"]));
+    }
+
+    #[test]
+    fn batch_translation_prompt_formatting_and_tone() {
+        let r = breq(vec![("c0", "a", Lang::Ko, vec![Lang::En])], Tone::Formal);
+        assert!(batch_translation_prompt(&r, "sonnet").contains("never reformat"));
+        let soft = batch_translation_prompt(&r, "haiku");
+        assert!(!soft.contains("never reformat"));
+        assert!(soft.contains("formal"));
+    }
+
+    #[test]
+    fn batch_correction_prompt_never_mentions_translation() {
+        use ct_core::BatchCorrectionItem;
+        for mode in [CorrectionMode::Spelling, CorrectionMode::Polish] {
+            for model in ["", "haiku", "sonnet"] {
+                let r = BatchCorrectionRequest {
+                    items: vec![BatchCorrectionItem {
+                        id: "c0".into(),
+                        text: "가 ⟦0⟧".into(),
+                    }],
+                    mode,
+                };
+                let p = batch_correction_prompt(&r, model);
+                assert!(
+                    !p.to_lowercase().contains("translat"),
+                    "{mode:?} {model}: {p}"
+                );
+                assert!(p.contains(r#"{"corrections": [{"id": str, "corrected": str}]}"#));
+                assert!(p.contains(r#"{"items": [{"id": "c0", "text": "가 ⟦0⟧"}]}"#));
+                assert_eq!(
+                    p.contains(POLISH_MERGE_SPLIT_INSTRUCTION),
+                    mode == CorrectionMode::Polish
+                );
+            }
         }
     }
 
