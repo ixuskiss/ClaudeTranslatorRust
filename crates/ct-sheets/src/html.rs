@@ -15,6 +15,7 @@ use crate::model::{CellKind, SheetCell, SheetGrid, SheetsParseError};
 const ORIGIN_MARKER: &str = "google-sheets-html-origin";
 const MAX_SPAN: usize = 10_000;
 const MAX_SPAN_AREA: usize = 100_000;
+const MAX_OCCUPIED: usize = 1_000_000;
 
 enum Token<'a> {
     Start {
@@ -86,7 +87,9 @@ fn decode_entities(raw: &str) -> String {
                     if !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
                         return None;
                     }
-                    char::from_u32(code).unwrap_or('\u{fffd}')
+                    char::from_u32(code)
+                        .filter(|&c| c != '\0')
+                        .unwrap_or('\u{fffd}')
                 }
             };
             Some((ch, semi + 1))
@@ -233,6 +236,12 @@ fn tokenize(src: &str) -> Vec<Token<'_>> {
             }
             pos = end;
             text_start = end;
+        } else if next.is_ascii_alphabetic()
+            || (next == b'/' && b.get(pos + 2).is_some_and(u8::is_ascii_alphabetic))
+        {
+            // Unterminated tag: nothing later can close it either, so the rest is text
+            // (keeps tokenizing linear).
+            break;
         } else {
             pos += 1;
         }
@@ -328,6 +337,9 @@ fn grid_parse(source: &str) -> Result<GridParse, SheetsParseError> {
                     let row_span = parse_span(&attrs, "rowspan")?;
                     let col_span = parse_span(&attrs, "colspan")?;
                     if row_span * col_span > MAX_SPAN_AREA {
+                        return Err(SheetsParseError("invalid span attribute"));
+                    }
+                    if occupied.len() + row_span * col_span > MAX_OCCUPIED {
                         return Err(SheetsParseError("invalid span attribute"));
                     }
                     for rr in r..r + row_span {
@@ -893,5 +905,44 @@ mod tests {
         );
         let none = "<google-sheets-html-origin><table><tr></tr></table>";
         assert_eq!(parse_sheets_html(none, None), err("table has no cells"));
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn unterminated_tags_are_linear_and_become_text() {
+        let mut html = String::from("<google-sheets-html-origin><table><tr><td>");
+        html.push_str(&"<a ".repeat(50_000));
+        let grid = parse_sheets_html(&html, None);
+        // The unterminated tag swallows the rest as text, so the cell never closes.
+        assert_eq!(grid, Err(SheetsParseError("table has no cells")));
+        let quotes = format!("<x a=\"{}", "<b a=\"".repeat(50_000));
+        assert_eq!(tokenize(&quotes).len(), 1);
+        let ends = "</a ".repeat(50_000);
+        assert_eq!(tokenize(&ends).len(), 1);
+    }
+
+    #[test]
+    fn total_occupied_entries_are_capped() {
+        let td = "<td rowspan=\"1000\" colspan=\"100\"></td>";
+        let html = format!(
+            "<google-sheets-html-origin><table><tr>{}</tr></table>",
+            td.repeat(20)
+        );
+        assert_eq!(
+            parse_sheets_html(&html, None),
+            Err(SheetsParseError("invalid span attribute"))
+        );
+    }
+
+    #[test]
+    fn nul_and_surrogate_references_become_replacement_char() {
+        assert_eq!(
+            decode_entities("&#0;&#xD800;&#x110000;&#65;"),
+            "\u{fffd}\u{fffd}\u{fffd}A"
+        );
     }
 }
