@@ -139,7 +139,7 @@ mod win32 {
         RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::Memory::{
-        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+        GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
     };
     use windows::core::PCWSTR;
 
@@ -211,7 +211,7 @@ mod win32 {
         // SAFETY: 할당한 핸들은 SetClipboardData 성공 시에만 시스템이 소유하며,
         // 실패하면 여기서 해제한다.
         unsafe {
-            let hglobal = GlobalAlloc(GMEM_MOVEABLE, data.len().max(1))
+            let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, data.len().max(1))
                 .map_err(|_| ClipboardError::WriteFailed("alloc"))?;
             let ptr = GlobalLock(hglobal) as *mut u8;
             if ptr.is_null() {

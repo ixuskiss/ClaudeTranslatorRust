@@ -293,6 +293,7 @@ struct Fake {
     writes: Mutex<Vec<Formats>>,
     copy: Option<Formats>,
     ctrl_c_changes: bool,
+    fail_on: Option<Chord>,
 }
 
 impl Fake {
@@ -305,6 +306,7 @@ impl Fake {
             writes: Mutex::new(Vec::new()),
             copy,
             ctrl_c_changes,
+            fail_on: None,
         }
     }
     fn sent(&self) -> Vec<Chord> {
@@ -353,6 +355,12 @@ impl FormatClipboard for Fake {
 impl KeySender for Fake {
     fn send(&self, chord: Chord) -> Result<(), KeyError> {
         self.sent.lock().unwrap().push(chord);
+        if self.fail_on == Some(chord) {
+            return Err(KeyError::SendInputFailed {
+                sent: 0,
+                last_error: 5,
+            });
+        }
         if chord == Chord::CtrlC && self.ctrl_c_changes {
             if let Some(copy) = &self.copy {
                 *self.formats.lock().unwrap() = copy.clone();
@@ -568,4 +576,29 @@ fn unusable_cf_html_with_compact_data_fails_before_touching_clipboard() {
     assert!(f.sent().is_empty());
     assert!(f.writes.lock().unwrap().is_empty());
     assert_eq!(f.restores(), 0);
+}
+
+#[test]
+fn paste_key_failure_restores_clipboard_and_errors() {
+    let sel = captured_two_cells(None);
+    let probe = Probe::new(Some(URL), SEL, Some("A1:B1"));
+    let mut f = Fake::new(None, true);
+    f.fail_on = Some(Chord::CtrlV);
+    let cf = build_cf_html(&build_replacement_html(&sel.grid, &[((0, 0), "x".into())]).unwrap());
+    assert!(write_with(&probe, &f, &f, &sel, &cf, FAST).is_err());
+    assert_eq!(f.sent(), vec![Chord::CtrlV]);
+    assert_eq!(f.restores(), 1);
+}
+
+#[test]
+fn confirm_copy_key_failure_is_unconfirmed_ok_without_restore() {
+    let sel = captured_two_cells(None);
+    let probe = Probe::new(Some(URL), SEL, Some("A1:B1"));
+    let mut f = Fake::new(None, true);
+    f.fail_on = Some(Chord::CtrlC);
+    let cf = build_cf_html(&build_replacement_html(&sel.grid, &[((0, 0), "x".into())]).unwrap());
+    write_with(&probe, &f, &f, &sel, &cf, FAST).unwrap();
+    assert_eq!(f.sent(), vec![Chord::CtrlV, Chord::CtrlC]);
+    assert_eq!(f.restores(), 0);
+    assert_eq!(f.read_registered(HTML_FORMAT).unwrap(), cf.as_bytes());
 }

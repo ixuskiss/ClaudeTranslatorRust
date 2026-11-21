@@ -12,7 +12,7 @@ use crate::format_clipboard::{ClipboardGuard, FormatClipboard, wait_for_clipboar
 use crate::keys::{ALT_RELEASE_TIMEOUT, Chord, KeySender, wait_until_alt_released};
 use ct_sheets::{
     CUSTOM_FORMAT, CaptureError, ParsedAddress, SheetLocation, SheetSelection, SheetsInputState,
-    SheetsInteraction, SheetsRouting, UnsupportedReason, compact_from_custom,
+    SheetsInteraction, SheetsRouting, UnsupportedReason, changed_text_cells, compact_from_custom,
     extract_cf_html_fragment, input_state_from_role, is_google_sheets_url, native_payload,
     parse_range_address, parse_sheets_html, parse_sheets_url,
 };
@@ -269,7 +269,11 @@ pub(crate) fn write_with(
                 tracing::info!(error = %e, "sheets native payload rejected");
                 e.to_string()
             })?;
-            native_payload(&selection.grid, &fragment).map_err(|e| {
+            let replaced = changed_text_cells(&selection.grid, &fragment).map_err(|e| {
+                tracing::info!(error = %e, "sheets native payload rejected");
+                e.to_string()
+            })?;
+            native_payload(&selection.grid, &fragment, &replaced).map_err(|e| {
                 tracing::info!(error = %e, "sheets native payload rejected");
                 e.to_string()
             })?
@@ -294,15 +298,21 @@ pub(crate) fn write_with(
     wait_until_alt_released(keys, ALT_RELEASE_TIMEOUT);
     let before = cb.sequence_number();
     if let Err(e) = keys.send(Chord::CtrlV) {
-        tracing::warn!(error = %e, "sheets paste key failed; clipboard left untouched");
+        // 아무것도 Chrome에 닿지 않았으므로 사용자 클립보드를 되돌린다.
+        guard.mark_own_write();
+        guard.finish();
+        tracing::warn!(error = %e, "sheets paste key failed; clipboard restored");
         return Err("paste key failed".into());
     }
-    if let Err(e) = keys.send(Chord::CtrlC) {
-        tracing::warn!(error = %e, "sheets confirm copy key failed; clipboard left untouched");
-        return Err("confirm copy key failed".into());
-    }
-    // 5. 확인되면 복원, 아니면 그대로 둔다(D9).
-    if wait_for_clipboard_change(cb, before, timeouts.paste_confirm) {
+    let confirm_sent = match keys.send(Chord::CtrlC) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "sheets confirm copy key failed; paste not confirmed");
+            false
+        }
+    };
+    // 5. 확인되면 복원, 아니면 그대로 둔다(D9). 확인용 Ctrl+C 실패도 미확인으로 본다.
+    if confirm_sent && wait_for_clipboard_change(cb, before, timeouts.paste_confirm) {
         guard.mark_own_write();
         guard.finish();
         tracing::debug!("sheets paste confirmed");

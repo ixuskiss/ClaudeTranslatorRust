@@ -25,7 +25,7 @@ pub use model::{
 pub use outcome::{
     OutcomeReason, SheetsOutcome, SheetsStatus, SheetsTable, TableCell, UnsupportedReason,
 };
-pub use payload::{PayloadError, build_replacement_html, native_payload};
+pub use payload::{PayloadError, build_replacement_html, changed_text_cells, native_payload};
 pub use routing::{
     Route, SheetsInputState, SheetsRole, SheetsRouting, choose_route, input_state_from_role,
     is_google_sheets_url, parse_sheets_url, route_of,

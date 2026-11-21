@@ -172,26 +172,46 @@ pub fn build_replacement_html(
     Ok(result)
 }
 
+/// Keys of the text cells whose display text differs between `grid` and the parsed
+/// `new_fragment` (the cells a correction actually replaced).
+pub fn changed_text_cells(
+    grid: &SheetGrid,
+    new_fragment: &str,
+) -> Result<Vec<CellKey>, SheetsParseError> {
+    let new_grid = parse_sheets_html(new_fragment, None)?;
+    let mut keys = Vec::new();
+    for cell in &grid.cells {
+        if cell.kind != CellKind::Text {
+            continue;
+        }
+        let Some(new) = new_grid.cell(cell.row, cell.col) else {
+            return Err(SheetsParseError("replacement cell missing"));
+        };
+        if new.display_text != cell.display_text {
+            keys.push((cell.row, cell.col));
+        }
+    }
+    Ok(keys)
+}
+
 /// The native custom-clipboard payload for a paste of `new_fragment`, or `None`
-/// when the capture carried no compact data. Strings are replaced for EVERY
-/// original non-blank text cell (not only the translated ones), so such cells lose
-/// their character runs; whitespace-only cells keep them.
+/// when the capture carried no compact data. Only the `replaced` cells get new
+/// strings (and lose their character runs); every other cell keeps its compact data.
 pub fn native_payload(
     grid: &SheetGrid,
     new_fragment: &str,
+    replaced: &[CellKey],
 ) -> Result<Option<Vec<u8>>, SheetsParseError> {
     let Some(compact) = grid.compact_json.as_deref() else {
         return Ok(None);
     };
     let new_grid = parse_sheets_html(new_fragment, None)?;
     let mut replacements: Vec<(CellKey, String)> = Vec::new();
-    for cell in &grid.cells {
-        if cell.kind == CellKind::Text && !cell.display_text.trim().is_empty() {
-            let Some(new) = new_grid.cell(cell.row, cell.col) else {
-                return Err(SheetsParseError("replacement cell missing"));
-            };
-            replacements.push(((cell.row, cell.col), new.display_text.clone()));
-        }
+    for &(row, col) in replaced {
+        let Some(new) = new_grid.cell(row, col) else {
+            return Err(SheetsParseError("replacement cell missing"));
+        };
+        replacements.push(((row, col), new.display_text.clone()));
     }
     let data: Value =
         serde_json::from_str(compact).map_err(|_| SheetsParseError("invalid compact JSON"))?;
@@ -482,7 +502,7 @@ mod tests {
     #[test]
     fn native_payload_none_without_compact() {
         let grid = grid_of(MIXED);
-        assert_eq!(native_payload(&grid, MIXED), Ok(None));
+        assert_eq!(native_payload(&grid, MIXED, &[]), Ok(None));
     }
 
     #[test]
@@ -493,7 +513,11 @@ mod tests {
                       <td><b> </b></td></tr></table>";
         let grid = parse_sheets_html(source, Some(&data)).unwrap();
         let new_html = build_replacement_html(&grid, &rep(&[(0, 0, "안녕")])).unwrap();
-        let payload = native_payload(&grid, &new_html).unwrap().unwrap();
+        let replaced = changed_text_cells(&grid, &new_html).unwrap();
+        assert_eq!(replaced, vec![(0, 0)]);
+        let payload = native_payload(&grid, &new_html, &replaced)
+            .unwrap()
+            .unwrap();
         let native = native_json(&payload);
         assert_eq!(native["3"]["4"], json!(["안녕", " "]));
         assert_eq!(native["17"], data["17"]);
@@ -506,20 +530,24 @@ mod tests {
     }
 
     #[test]
-    fn native_payload_replaces_every_nonblank_text_cell_and_drops_its_runs() {
+    fn native_payload_drops_runs_only_of_replaced_cells() {
         let data = json!({"2": [1219, 1219, 203], "3": {"1": [2, 2, 2], "4": ["a", "b", "c"]},
             "15": {"1": 1, "2": 3}, "8": ["=\"c\""], "9": [0],
             "17": [{"1": [{"1": 0, "2": {"5": 1}}]}, {"1": [{"1": 0, "2": {"6": 1}}]}]});
         let source =
             "<google-sheets-html-origin><table><tr><td>a</td><td>b</td><td>c</td></tr></table>";
         let grid = parse_sheets_html(source, Some(&data)).unwrap();
-        // Only the first cell is translated; the second is rewritten with its own text.
+        // Only the first cell is replaced; the unchanged formatted second cell keeps its runs.
         let new_html = build_replacement_html(&grid, &rep(&[(0, 0, "번역")])).unwrap();
-        let payload = native_payload(&grid, &new_html).unwrap().unwrap();
+        let replaced = changed_text_cells(&grid, &new_html).unwrap();
+        assert_eq!(replaced, vec![(0, 0)]);
+        let payload = native_payload(&grid, &new_html, &replaced)
+            .unwrap()
+            .unwrap();
         let native = native_json(&payload);
         assert_eq!(native["3"]["4"], json!(["번역", "b", "c"]));
-        assert_eq!(native["2"], json!([195, 195, 203]));
-        assert!(native.get("17").is_none());
+        assert_eq!(native["2"], json!([195, 1219, 203]));
+        assert_eq!(native["17"], json!([data["17"][1].clone()]));
         assert_eq!(native["8"], data["8"]);
     }
 
@@ -531,7 +559,7 @@ mod tests {
             Some(&data),
         )
         .unwrap();
-        assert!(native_payload(&grid, "<p>nope</p>").is_err());
+        assert!(native_payload(&grid, "<p>nope</p>", &[(0, 0)]).is_err());
     }
 
     #[test]
