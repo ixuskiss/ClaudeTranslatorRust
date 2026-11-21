@@ -154,6 +154,40 @@ fn scan_tokens(text: &str) -> Vec<(usize, usize)> {
     tokens
 }
 
+/// Shifts every placeholder owned by `result` from `⟦i⟧` to `⟦i+offset⟧` in one pass (renamed
+/// tokens are never renamed again), so several masked texts can share one placeholder space.
+pub fn renumber(result: MaskResult, offset: usize) -> MaskResult {
+    if offset == 0 {
+        return result;
+    }
+    let text = &result.masked_text;
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (s, e) in scan_tokens(text) {
+        out.push_str(&text[last..s]);
+        let token = &text[s..e];
+        match result.mapping.iter().position(|m| m.placeholder == token) {
+            Some(i) => out.push_str(&placeholder(i + offset)),
+            None => out.push_str(token),
+        }
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    let mapping = result
+        .mapping
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| MaskMatch {
+            placeholder: placeholder(i + offset),
+            ..m
+        })
+        .collect();
+    MaskResult {
+        masked_text: out,
+        mapping,
+    }
+}
+
 pub fn restore(
     masked: &str,
     mapping: &[MaskMatch],
@@ -568,6 +602,18 @@ mod tests {
         assert_eq!(
             restore(&r.masked_text, &r.mapping, Lang::En).unwrap(),
             "👍 DA ok"
+        );
+    }
+
+    #[test]
+    fn renumber_shifts_placeholders_in_one_pass() {
+        let r = renumber(mask("DA B", &[keep("DA"), keep("B")]), 1);
+        assert_eq!(r.masked_text, "⟦1⟧ ⟦2⟧");
+        assert_eq!(r.mapping[0].placeholder, "⟦1⟧");
+        assert_eq!(r.mapping[1].placeholder, "⟦2⟧");
+        assert_eq!(
+            restore(&r.masked_text, &r.mapping, Lang::En).unwrap(),
+            "DA B"
         );
     }
 

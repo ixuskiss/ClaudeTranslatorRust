@@ -55,4 +55,13 @@ mod tests {
             "  가\n\nA"
         );
     }
+
+    #[test]
+    fn compose_replacement_drops_blank_blocks() {
+        assert_eq!(
+            compose_replacement(Some(""), &["A".into(), "\n".into(), "".into(), "B".into()]),
+            "A\n\nB"
+        );
+        assert_eq!(compose_replacement(None, &["\r\n".into()]), "");
+    }
 }
