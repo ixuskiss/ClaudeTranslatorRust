@@ -36,8 +36,8 @@ use ct_llm::{
 };
 use ct_sheets::{CaptureError, SheetSelection, SheetsInputState, SheetsInteraction, SheetsRouting};
 use ct_win::chrome::{
-    ChromeAdapter, READ_ONLY_STRATEGIES, REPLACE_STRATEGIES, RetryingInteraction, TextInteraction,
-    UiaBackend, WindowsUiaBackend,
+    ChromeAdapter, READ_ONLY_STRATEGIES, REPLACE_STRATEGIES, RetryingInteraction, SheetsEditSafe,
+    TextInteraction, UiaBackend, WindowsSheetsBackend, WindowsUiaBackend,
 };
 use ct_win::clipboard::{Clipboard, Win32Clipboard};
 use ct_win::format_clipboard::Win32FormatClipboard;
@@ -112,31 +112,58 @@ struct AppAction {
     badge: Arc<dyn Badge>,
     notifier: Arc<dyn Notifier>,
     view: Arc<dyn ExplainView>,
-    sheets_routing: Box<dyn SheetsRouting>,
-    sheets_range: Box<dyn SheetsInteraction>,
+    /// Alt+Alt and Ctrl+Alt+Alt.
+    sheets_replace: SheetsPorts,
+    /// Ctrl+Ctrl and Alt+Ctrl+Ctrl.
+    sheets_explain: SheetsPorts,
     sheets_config: SheetsConfig,
 }
 
-/// Placeholder Sheets ports until the Windows Sheets backend is wired in: routing always
-/// answers "not Sheets", so every gesture takes the text flow and the range port is never
-/// reached.
-struct NoSheetsBackend;
+/// One Sheets backend instance as the two ports the flows read (S-ref §1.4: the replace
+/// family and the explain family each get their own instance).
+struct SheetsPorts {
+    routing: Box<dyn SheetsRouting>,
+    range: Box<dyn SheetsInteraction>,
+}
 
-impl SheetsRouting for NoSheetsBackend {
+/// Lets one shared backend serve both ports.
+struct Shared<B>(Arc<B>);
+
+impl<B: SheetsRouting> SheetsRouting for Shared<B> {
     fn url_and_state(&self) -> (Option<String>, Option<SheetsInputState>) {
-        (None, None)
+        self.0.url_and_state()
     }
 }
 
-impl SheetsInteraction for NoSheetsBackend {
+impl<B: SheetsInteraction> SheetsInteraction for Shared<B> {
     fn capture_selection(&self) -> Result<SheetSelection, CaptureError> {
-        Err(CaptureError { reason: None })
+        self.0.capture_selection()
+    }
+    fn reread_selection(&self) -> Result<SheetSelection, CaptureError> {
+        self.0.reread_selection()
     }
     fn can_edit(&self) -> bool {
-        false
+        self.0.can_edit()
     }
-    fn write_selection(&self, _: &SheetSelection, _: &str) -> Result<(), String> {
-        Err("sheets backend not available".into())
+    fn write_selection(&self, selection: &SheetSelection, text: &str) -> Result<(), String> {
+        self.0.write_selection(selection, text)
+    }
+}
+
+impl SheetsPorts {
+    fn of<B: SheetsRouting + SheetsInteraction + 'static>(backend: Arc<B>) -> Self {
+        Self {
+            routing: Box::new(Shared(Arc::clone(&backend))),
+            range: Box::new(Shared(backend)),
+        }
+    }
+
+    fn deps<'a>(&'a self, config: &'a SheetsConfig) -> SheetsDeps<'a> {
+        SheetsDeps {
+            routing: self.routing.as_ref(),
+            range: self.range.as_ref(),
+            config,
+        }
     }
 }
 
@@ -148,26 +175,26 @@ impl GestureAction for AppAction {
             detector: self.detector.as_ref(),
             llm: snapshot.llm.as_ref(),
         };
-        let sheets = SheetsDeps {
-            routing: self.sheets_routing.as_ref(),
-            range: self.sheets_range.as_ref(),
-            config: &self.sheets_config,
-        };
+        let replace_sheets = self.sheets_replace.deps(&self.sheets_config);
+        let explain_sheets = self.sheets_explain.deps(&self.sheets_config);
         match gesture {
             Gesture::AltAlt => alt_alt_flow(
                 &deps,
-                &sheets,
+                &replace_sheets,
                 self.replace.as_ref(),
                 &|| (self.docs_or_slides)().then_some(MSG_ALT_NO_SELECTION_DOCS),
                 self.badge.as_ref(),
                 self.notifier.as_ref(),
             ),
-            Gesture::CtrlCtrl => {
-                ctrl_ctrl_flow(&deps, &sheets, self.view_only.as_ref(), self.view.as_ref())
-            }
+            Gesture::CtrlCtrl => ctrl_ctrl_flow(
+                &deps,
+                &explain_sheets,
+                self.view_only.as_ref(),
+                self.view.as_ref(),
+            ),
             Gesture::CtrlHeldAltAlt => correction_replace_flow(
                 &deps,
-                &sheets,
+                &replace_sheets,
                 self.replace.as_ref(),
                 self.modifiers_released.as_ref(),
                 self.badge.as_ref(),
@@ -175,7 +202,7 @@ impl GestureAction for AppAction {
             ),
             Gesture::AltHeldCtrlCtrl => correction_view_flow(
                 &deps,
-                &sheets,
+                &explain_sheets,
                 self.view_only.as_ref(),
                 self.modifiers_released.as_ref(),
                 self.view.as_ref(),
@@ -501,16 +528,16 @@ fn main() {
     });
 
     let keys = Arc::new(Win32KeySender);
+    let format_clipboard: Arc<Win32FormatClipboard> = Arc::new(Win32FormatClipboard);
     let clipboard: Arc<dyn Clipboard> = Arc::new(Win32Clipboard);
     let uia = Arc::new(WindowsUiaBackend::new(
         keys.clone(),
         Arc::clone(&clipboard),
-        Arc::new(Win32FormatClipboard),
+        format_clipboard.clone(),
     ));
-    let replace = RetryingInteraction::new(ChromeAdapter::new(
-        uia.clone(),
-        Arc::clone(&clipboard),
-        &REPLACE_STRATEGIES,
+    let replace = RetryingInteraction::new(SheetsEditSafe::new(
+        ChromeAdapter::new(uia.clone(), Arc::clone(&clipboard), &REPLACE_STRATEGIES),
+        config.sheets.edit_full_cell_replace_enabled,
     ));
     let view_only = RetryingInteraction::new(ChromeAdapter::new(
         uia.clone(),
@@ -545,8 +572,20 @@ fn main() {
         badge,
         notifier: explain.clone(),
         view: explain,
-        sheets_routing: Box::new(NoSheetsBackend),
-        sheets_range: Box::new(NoSheetsBackend),
+        sheets_replace: SheetsPorts::of(Arc::new(WindowsSheetsBackend::new(
+            keys.clone(),
+            format_clipboard.clone(),
+            config.sheets.range_replace_enabled,
+            false,
+            config.sheets.max_range_cells,
+        ))),
+        sheets_explain: SheetsPorts::of(Arc::new(WindowsSheetsBackend::new(
+            keys.clone(),
+            format_clipboard.clone(),
+            false,
+            true,
+            config.sheets.max_range_cells,
+        ))),
         sheets_config: config.sheets.clone(),
     };
     let dispatcher = Dispatcher::new(Arc::clone(&state), Arc::new(action));
@@ -707,7 +746,46 @@ mod tests {
         }
     }
 
+    struct FakeRouting(Option<SheetsInputState>);
+
+    impl SheetsRouting for FakeRouting {
+        fn url_and_state(&self) -> (Option<String>, Option<SheetsInputState>) {
+            match self.0 {
+                Some(state) => (
+                    Some("https://docs.google.com/spreadsheets/d/x/edit".into()),
+                    Some(state),
+                ),
+                None => (None, None),
+            }
+        }
+    }
+
+    struct FailingRange;
+
+    impl SheetsInteraction for FailingRange {
+        fn capture_selection(&self) -> Result<SheetSelection, CaptureError> {
+            Err(CaptureError { reason: None })
+        }
+        fn can_edit(&self) -> bool {
+            false
+        }
+        fn write_selection(&self, _: &SheetSelection, _: &str) -> Result<(), String> {
+            Err("unused".into())
+        }
+    }
+
+    fn ports(state: Option<SheetsInputState>) -> SheetsPorts {
+        SheetsPorts {
+            routing: Box::new(FakeRouting(state)),
+            range: Box::new(FailingRange),
+        }
+    }
+
     fn action(log: &Log) -> AppAction {
+        action_with(log, None)
+    }
+
+    fn action_with(log: &Log, state: Option<SheetsInputState>) -> AppAction {
         let recorder = Arc::new(Recorder(log.clone()));
         AppAction {
             detector: Box::new(RuleBasedDetector),
@@ -718,8 +796,8 @@ mod tests {
             badge: recorder.clone(),
             notifier: recorder.clone(),
             view: recorder,
-            sheets_routing: Box::new(NoSheetsBackend),
-            sheets_range: Box::new(NoSheetsBackend),
+            sheets_replace: ports(state),
+            sheets_explain: ports(state),
             sheets_config: SheetsConfig::default(),
         }
     }
@@ -821,6 +899,19 @@ mod tests {
         let got = take(&log);
         assert_eq!(got[0], "capture");
         assert!(got[1].starts_with("view.error:"), "{got:?}");
+    }
+
+    #[test]
+    fn sheets_range_route_reaches_range_flow() {
+        let log = Log::default();
+        let a = action_with(&log, Some(SheetsInputState::CellSelection));
+        a.run(Gesture::AltAlt, snapshot());
+        let got = take(&log);
+        assert!(
+            got.contains(&"notify:선택한 셀을 읽을 수 없습니다.".to_string()),
+            "{got:?}"
+        );
+        assert!(!got.contains(&"capture".to_string()), "{got:?}");
     }
 
     #[test]
