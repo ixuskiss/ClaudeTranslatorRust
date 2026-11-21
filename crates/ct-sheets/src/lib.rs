@@ -4,6 +4,7 @@
 
 pub mod cf_html;
 pub mod custom_clipboard;
+pub mod html;
 pub mod model;
 pub mod outcome;
 pub mod routing;
@@ -14,6 +15,7 @@ pub use custom_clipboard::{
     CUSTOM_FORMAT, CUSTOM_MIME, CompactItem, compact_cells, compact_from_custom,
     decode_custom_data, encode_custom_data, expand_runs, replace_compact_strings,
 };
+pub use html::{html_rich_text_state, parse_sheets_html};
 pub use model::{
     CellKey, CellKind, SheetCell, SheetGrid, SheetLocation, SheetSelection, SheetsParseError,
 };
