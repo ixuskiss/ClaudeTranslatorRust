@@ -54,7 +54,7 @@ fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|i| i + from)
 }
 
-fn decode_entities(raw: &str) -> String {
+pub(crate) fn decode_entities(raw: &str) -> String {
     if !raw.contains('&') {
         return raw.to_string();
     }

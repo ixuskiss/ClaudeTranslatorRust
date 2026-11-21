@@ -7,8 +7,10 @@ pub mod custom_clipboard;
 pub mod html;
 pub mod model;
 pub mod outcome;
+pub mod payload;
 pub mod routing;
 pub mod support;
+pub mod verify;
 
 pub use cf_html::{build_cf_html, extract_cf_html_fragment};
 pub use custom_clipboard::{
@@ -22,6 +24,7 @@ pub use model::{
 pub use outcome::{
     OutcomeReason, SheetsOutcome, SheetsStatus, SheetsTable, TableCell, UnsupportedReason,
 };
+pub use payload::{PayloadError, build_replacement_html, native_payload};
 pub use routing::{
     Route, SheetsInputState, SheetsRole, SheetsRouting, choose_route, input_state_from_role,
     is_google_sheets_url, parse_sheets_url, route_of,
@@ -30,3 +33,4 @@ pub use support::{
     ParsedAddress, SheetsMode, check_range_support, column_letters, parse_range_address,
     range_origin, translatable_cells,
 };
+pub use verify::{same_target, written_as_expected};
