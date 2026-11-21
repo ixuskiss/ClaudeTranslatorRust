@@ -11,6 +11,17 @@ export struct ExplainCard {
     translations: [ExplainLine],
 }
 
+export struct SheetCell {
+    present: bool,
+    original: string,
+    lines: [ExplainLine],
+}
+
+export struct SheetRow {
+    header: string,
+    cells: [SheetCell],
+}
+
 // Invisible strip along an edge or corner that starts a native resize in `dir`.
 component Edge inherits TouchArea {
     in property <string> dir;
@@ -25,8 +36,14 @@ component Edge inherits TouchArea {
 export component ExplainWin inherits Window {
     in property <string> status;
     in property <[ExplainCard]> cards;
-    out property <length> content-width: column.preferred-width;
-    out property <length> content-height: column.preferred-height;
+    in property <bool> has-table;
+    in property <string> table-caption;
+    in property <[string]> col-headers;
+    in property <[SheetRow]> table-rows;
+    // Table geometry (S-ref 7.2): fixed 220 px columns, 28 px minimum row height.
+    out property <length> table-width: 40px + root.col-headers.length * 220px;
+    out property <length> content-width: root.has-table ? root.table-width : column.preferred-width;
+    out property <length> content-height: root.has-table ? tcol.preferred-height : column.preferred-height;
     callback close-requested();
     callback drag-requested();
     callback resize-requested(string);
@@ -105,7 +122,100 @@ export component ExplainWin inherits Window {
                     wrap: word-wrap;
                 }
 
+                tv := ScrollView {
+                    visible: root.has-table;
+                    max-height: root.has-table ? 100000px : 0px;
+                    vertical-stretch: 1;
+                    content-width: root.table-width;
+                    content-height: tcol.preferred-height;
+                    tcol := VerticalLayout {
+                        width: root.table-width;
+                        alignment: start;
+                        if root.table-caption != "": Text {
+                            text: root.table-caption;
+                            font-weight: 700;
+                            color: #8A8A8A;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            height: 24px;
+                            Rectangle {
+                                width: 40px;
+                                background: #F1E4E1;
+                            }
+
+                            for h in root.col-headers: Rectangle {
+                                width: 220px;
+                                background: #F1E4E1;
+                                Text {
+                                    text: h;
+                                    font-weight: 700;
+                                    color: #8A8A8A;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        for row in root.table-rows: HorizontalLayout {
+                            min-height: 28px;
+                            Rectangle {
+                                width: 40px;
+                                background: #F1E4E1;
+                                Text {
+                                    text: row.header;
+                                    color: #8A8A8A;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            for cell in row.cells: Rectangle {
+                                width: 220px;
+                                background: #FFFFFF;
+                                border-width: 1px;
+                                border-color: #E6D5D1;
+                                VerticalLayout {
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    padding-top: 4px;
+                                    padding-bottom: 4px;
+                                    spacing: 2px;
+                                    alignment: start;
+                                    if cell.present: TextInput {
+                                        text: cell.original;
+                                        read-only: true;
+                                        single-line: false;
+                                        wrap: word-wrap;
+                                        font-weight: 700;
+                                        color: #2B2B2B;
+                                    }
+
+                                    for line in cell.lines: VerticalLayout {
+                                        if line.tag != "": Text {
+                                            text: line.tag;
+                                            font-size: 10px;
+                                            color: #8A8A8A;
+                                        }
+                                        TextInput {
+                                            text: line.text;
+                                            read-only: true;
+                                            single-line: false;
+                                            wrap: word-wrap;
+                                            font-weight: 700;
+                                            color: #2563EB;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 sv := ScrollView {
+                    visible: !root.has-table;
+                    max-height: root.has-table ? 0px : 100000px;
                     vertical-stretch: 1;
                     content-width: self.visible-width;
                     content-height: column.preferred-height;
