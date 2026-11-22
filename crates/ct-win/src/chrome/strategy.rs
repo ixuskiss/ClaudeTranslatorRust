@@ -96,8 +96,12 @@ impl Strategy {
                     text,
                 })
             }
-            Strategy::GoogleChatReadOnly => selection_only(f, "google_chat", "selection"),
-            Strategy::GmailReadOnly => selection_only(f, "gmail", "selection"),
+            // Ctrl+Ctrl: a selection anywhere (also received messages) wins; without one, the
+            // same whole-field rule as Alt+Alt (compose / subject / body), never empty.
+            Strategy::GoogleChatReadOnly => selection_only(f, "google_chat", "selection")
+                .or_else(|| non_empty_field(Strategy::GoogleChat.identify_context(f)?)),
+            Strategy::GmailReadOnly => selection_only(f, "gmail", "selection")
+                .or_else(|| non_empty_field(Strategy::Gmail.identify_context(f)?)),
             Strategy::GoogleDocs => selection_only(f, "google_docs", "selection"),
             // field_id는 선택 여부와 무관하게 "textbox" (교체 시 컨텍스트 재검증용).
             Strategy::GoogleSlides => {
@@ -163,6 +167,11 @@ fn selection_or_full(f: &FocusedElement) -> (bool, String) {
         Some(sel) => (true, sel.to_string()),
         None => (false, f.full_text.clone()),
     }
+}
+
+/// A whole-field context only when the field has text (nothing to view otherwise).
+fn non_empty_field(ctx: EditingContext) -> Option<EditingContext> {
+    (!ctx.text.trim().is_empty()).then_some(ctx)
 }
 
 fn selection_only(
@@ -362,6 +371,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_read_only_uses_whole_compose_without_selection() {
+        // Ctrl+Ctrl has the same scope as Alt+Alt outside Docs: no block → the whole field.
+        let e = fe(CHAT, Role::Compose, "draft line 1\ndraft line 2", None);
+        assert_eq!(
+            Strategy::GoogleChatReadOnly.identify_context(&e),
+            Some(ctx(
+                "google_chat",
+                "compose",
+                false,
+                "draft line 1\ndraft line 2"
+            ))
+        );
+        let empty = fe(CHAT, Role::Compose, "", None);
+        assert_eq!(Strategy::GoogleChatReadOnly.identify_context(&empty), None);
+    }
+
+    #[test]
     fn gmail_read_only_captures_selection_regardless_of_role() {
         let e = fe(
             "https://mail.google.com/mail/u/0/#inbox/abc",
@@ -389,6 +415,26 @@ mod tests {
             None,
         );
         assert_eq!(Strategy::GmailReadOnly.identify_context(&e), None);
+    }
+
+    #[test]
+    fn gmail_read_only_uses_whole_subject_or_body_without_selection() {
+        let url = "https://mail.google.com/mail/u/0/#inbox?compose=new";
+        let body = fe(url, Role::Body, "line 1\nline 2", None);
+        assert_eq!(
+            Strategy::GmailReadOnly.identify_context(&body),
+            Some(ctx("gmail", "body", false, "line 1\nline 2"))
+        );
+        let subject = fe(url, Role::Subject, "hello", None);
+        assert_eq!(
+            Strategy::GmailReadOnly.identify_context(&subject),
+            Some(ctx("gmail", "subject", false, "hello"))
+        );
+        // Recipient fields are never targeted, selection or not.
+        assert_eq!(
+            Strategy::GmailReadOnly.identify_context(&fe(url, Role::To, "a@b.c", None)),
+            None
+        );
     }
 
     #[test]
