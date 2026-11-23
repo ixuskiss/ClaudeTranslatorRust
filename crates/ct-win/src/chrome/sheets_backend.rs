@@ -362,7 +362,13 @@ impl SheetsProbe for UiaProbe<'_> {
             editor_value.as_deref(),
             self.empty_editor_is_selection,
         );
-        tracing::debug!(?role, ?state, "sheets focus state");
+        // Routing evidence for field reports; never the editor text itself.
+        tracing::info!(
+            ?role,
+            ?state,
+            editor_empty = editor_value.as_deref().map(|v| v.trim().is_empty()),
+            "sheets focus state"
+        );
         (Some(url), Some(state))
     }
 

@@ -129,9 +129,14 @@ impl Strategy {
                 if full.trim_start().starts_with('=') {
                     return None;
                 }
+                // An empty editor with copied text means the grid cell itself was copied (a
+                // selection, not an edit): a plain-text paste would spill multi-line results
+                // into the cells below. The range route handles that case (deviation from v5).
+                if full.trim().is_empty() {
+                    return None;
+                }
                 let (has_selection, text) = match non_empty_selection(f) {
                     Some(sel) => (true, sel.to_string()),
-                    None if full.trim().is_empty() => return None,
                     None => (false, full.to_string()),
                 };
                 Some(EditingContext {
@@ -634,6 +639,17 @@ mod tests {
     fn sheets_empty_cell_without_selection_is_rejected() {
         assert_eq!(S.identify_context(&sheets_cell(Some("  "), None)), None);
         assert_eq!(S.identify_context(&sheets_cell(Some(""), None)), None);
+    }
+
+    #[test]
+    fn sheets_copied_cell_with_empty_editor_is_rejected() {
+        // A grid selection whose hidden editor is empty: the copy holds the cell itself, not
+        // text selected inside an editor. Pasting a multi-line result there would spill into
+        // the cells below, so this is never a cell-edit target.
+        let e = sheets_cell(Some(""), Some("모니터링(APM, Log, Zenius 감시 등)"));
+        assert_eq!(S.identify_context(&e), None);
+        let e = sheets_cell(Some("  "), Some("시스템 Availability 체크"));
+        assert_eq!(S.identify_context(&e), None);
     }
 
     #[test]

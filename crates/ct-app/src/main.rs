@@ -585,7 +585,10 @@ fn main() {
             keys.clone(),
             format_clipboard.clone(),
             config.sheets.range_replace_enabled,
-            false,
+            // An empty address-named editor is a cell selection for Alt+Alt too (v5 used false):
+            // otherwise a selected cell went down the text path and a multi-line, multi-Target
+            // result was pasted as plain text into the cells below.
+            true,
             config.sheets.max_range_cells,
         ))),
         sheets_explain: SheetsPorts::of(Arc::new(WindowsSheetsBackend::new(
